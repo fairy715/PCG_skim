@@ -20,7 +20,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The HTTP client for every call to a model provider.
 pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::net::http_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()

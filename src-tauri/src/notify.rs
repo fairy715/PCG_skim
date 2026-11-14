@@ -99,6 +99,8 @@ fn mark_read_label(locale: &str) -> &'static str {
         "pl" => "Przeczytane",
         "sr" => "Pročitano",
         "zh" => "标为已读",
+        "zh-TW" => "標示為已讀",
+        "id" => "Tandai dibaca",
         "ja" => "既読にする",
         "ko" => "읽음",
         _ => "Mark read",

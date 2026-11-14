@@ -11,6 +11,8 @@ export type Locale =
   | "it"
   | "pl"
   | "zh"
+  | "zh-TW"
+  | "id"
   | "ja"
   | "ko";
 
@@ -23,7 +25,9 @@ export const LOCALES: { code: Locale; label: string }[] = [
   { code: "es", label: "Español" },
   { code: "it", label: "Italiano" },
   { code: "pl", label: "Polski" },
-  { code: "zh", label: "中文" },
+  { code: "zh", label: "简体中文" },
+  { code: "zh-TW", label: "繁體中文" },
+  { code: "id", label: "Bahasa Indonesia" },
   { code: "ja", label: "日本語" },
   { code: "ko", label: "한국어" },
 ];
@@ -38,6 +42,8 @@ const loaders: Record<Locale, () => Promise<Record<string, string>>> = {
   it: () => import("./locales/it.json").then((m) => m.default),
   pl: () => import("./locales/pl.json").then((m) => m.default),
   zh: () => import("./locales/zh.json").then((m) => m.default),
+  "zh-TW": () => import("./locales/zh-TW.json").then((m) => m.default),
+  id: () => import("./locales/id.json").then((m) => m.default),
   ja: () => import("./locales/ja.json").then((m) => m.default),
   ko: () => import("./locales/ko.json").then((m) => m.default),
 };

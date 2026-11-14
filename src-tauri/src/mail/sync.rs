@@ -2499,7 +2499,7 @@ impl Engine {
                 // pinned so a second DNS answer can't swap in a private one.
                 let (target, addrs) = crate::net::vet_public_url(url, true, "unsubscribe").await?;
                 let host = target.host_str().unwrap_or_default().to_string();
-                let client = reqwest::Client::builder()
+                let client = crate::net::http_builder()
                     // A redirect could hop from the vetted https host to an
                     // internal one; RFC 8058 expects a direct 2xx anyway.
                     .redirect(reqwest::redirect::Policy::none())

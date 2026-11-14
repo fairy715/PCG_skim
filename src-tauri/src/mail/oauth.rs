@@ -30,7 +30,7 @@ pub const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)
 fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::net::http_builder()
             .timeout(HTTP_TIMEOUT)
             .build()
             .unwrap_or_default()

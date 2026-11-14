@@ -70,6 +70,9 @@ jobs:
 
   scoop:
     needs: build
+    # Upstream-only: this fork ships through its own releases + in-app updater,
+    # not Scoop, and must not push manifest commits to its main.
+    if: github.repository == 'nikserg/skim'
     runs-on: ubuntu-latest
     permissions:
       contents: write

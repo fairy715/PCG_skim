@@ -54,6 +54,7 @@ const ALLOWED: &[Lang] = &[
     Lang::Ara,
     Lang::Heb,
     Lang::Hin,
+    Lang::Ind,
 ];
 
 fn detector() -> &'static Detector {
@@ -132,7 +133,7 @@ fn writes(lang: &str, script: Script) -> bool {
         "ar" => script == Script::Arabic,
         "he" => script == Script::Hebrew,
         "hi" => script == Script::Devanagari,
-        "cs" | "de" | "en" | "es" | "fr" | "it" | "nl" | "pl" | "pt" | "sv" | "tr" => {
+        "cs" | "de" | "en" | "es" | "fr" | "id" | "it" | "nl" | "pl" | "pt" | "sv" | "tr" => {
             script == Script::Latin
         }
         _ => true,
@@ -191,6 +192,7 @@ fn iso1(lang: Lang) -> Option<&'static str> {
         Lang::Ara => "ar",
         Lang::Heb => "he",
         Lang::Hin => "hi",
+        Lang::Ind => "id",
         _ => return None,
     })
 }

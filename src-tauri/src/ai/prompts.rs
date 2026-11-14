@@ -376,6 +376,10 @@ pub fn style_analysis(samples: &[String], locale: &str) -> (String, String) {
 /// naming a translation target: `sr` next to `hr` and `sl` has to be
 /// unambiguous.
 fn language_name(locale: &str) -> &str {
+    // Before the region is dropped: the script is the whole point here.
+    if locale == "zh-TW" {
+        return "Chinese (Traditional, Taiwan)";
+    }
     match locale.split(['-', '_']).next().unwrap_or(locale) {
         "en" => "English",
         "ru" => "Russian",
@@ -388,6 +392,7 @@ fn language_name(locale: &str) -> &str {
         "zh" => "Chinese (Simplified)",
         "ja" => "Japanese",
         "ko" => "Korean",
+        "id" => "Indonesian",
         other => other,
     }
 }

@@ -39,11 +39,7 @@ impl async_imap::Authenticator for Xoauth2<'_> {
 }
 
 fn tls_connector() -> Result<TlsConnector> {
-    use rustls_platform_verifier::BuilderVerifierExt;
-    let config = rustls::ClientConfig::builder()
-        .with_platform_verifier()
-        .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(TlsConnector::from(Arc::new(crate::net::tls_config()?)))
 }
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);

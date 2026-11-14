@@ -437,6 +437,8 @@ fn tray_labels(locale: &str) -> (&'static str, &'static str) {
         "pl" => ("Otwórz Skim", "Zakończ"),
         "sr" => ("Otvori Skim", "Izlaz"),
         "zh" => ("打开 Skim", "退出"),
+        "zh-TW" => ("開啟 Skim", "結束"),
+        "id" => ("Buka Skim", "Keluar"),
         "ja" => ("Skim を開く", "終了"),
         "ko" => ("Skim 열기", "종료"),
         _ => ("Open Skim", "Quit"),

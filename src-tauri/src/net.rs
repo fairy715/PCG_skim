@@ -13,6 +13,32 @@ use futures::StreamExt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+/// The TLS client config for every outbound connection Skim makes: rustls
+/// verifying against the Windows certificate store. IMAP, SMTP (via lettre's
+/// own platform-verifier support) and HTTPS all trust the same roots, so a
+/// corporate CA or a self-signed server certificate that the machine trusts
+/// works everywhere — and nothing the machine distrusts is accepted anywhere.
+pub fn tls_config() -> Result<rustls::ClientConfig> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    Ok(rustls::ClientConfig::builder()
+        .with_platform_verifier()
+        .map_err(|e| SkimError::other("tls", format!("TLS setup failed: {e}")))?
+        .with_no_client_auth())
+}
+
+/// `reqwest::Client::builder()` with [`tls_config`] applied. Every HTTP client
+/// in the app starts here: reqwest's stock rustls setup trusts only its bundled
+/// public-CA list, which breaks behind a TLS-inspecting company proxy and for
+/// internal AI endpoints signed by a private CA.
+pub fn http_builder() -> reqwest::ClientBuilder {
+    match tls_config() {
+        Ok(config) => reqwest::Client::builder().use_preconfigured_tls(config),
+        // The platform verifier refused to initialize: fall back to the
+        // bundled roots rather than lose HTTP altogether.
+        Err(_) => reqwest::Client::builder(),
+    }
+}
+
 /// How long a single request may take before we give up.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Redirect hops we follow before refusing to chase further.
@@ -74,7 +100,7 @@ pub async fn fetch_page_text(url: &str, max_bytes: usize) -> Result<String> {
     for _ in 0..=MAX_REDIRECTS {
         let (target, addrs) = vet_public_url(&current, true, "fetch_url").await?;
         let host = target.host_str().unwrap_or_default().to_string();
-        let client = reqwest::Client::builder()
+        let client = http_builder()
             // Don't let reqwest auto-follow: each hop must be re-vetted, so we
             // handle 3xx ourselves.
             .redirect(reqwest::redirect::Policy::none())

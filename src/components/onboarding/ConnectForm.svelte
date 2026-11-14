@@ -35,6 +35,9 @@
   let detecting = $state(false);
   // Blur and Enter can both fire a lookup — only the newest address may win.
   let lookupSeq = 0;
+  // Fork addition: POP3 as a second way to receive. The host/port fields below
+  // then carry the POP3 server, and the account is created as provider "pop3".
+  let protocol = $state<"imap" | "pop3">("imap");
   let imapUser = $state("");
   let imapHost = $state("");
   let imapPort = $state(993);
@@ -104,6 +107,17 @@
       if (!smtpHost) smtpHost = `smtp.${domain}`;
       showAdvanced = true;
     }
+  }
+
+  /** Switch the receiving protocol, carrying over only what the user has not
+   *  typed themselves: a default port or a guessed `imap.`/`pop.` host. */
+  function chooseProtocol(next: "imap" | "pop3") {
+    if (next === protocol) return;
+    protocol = next;
+    const [fromPort, toPort] = next === "pop3" ? [993, 995] : [995, 993];
+    if (imapPort === fromPort) imapPort = toPort;
+    const [fromPrefix, toPrefix] = next === "pop3" ? ["imap.", "pop."] : ["pop.", "imap."];
+    if (imapHost.startsWith(fromPrefix)) imapHost = toPrefix + imapHost.slice(fromPrefix.length);
   }
 
   // The detected provider drives which sign-in method the screen leads with.
@@ -183,7 +197,7 @@
       const input: AddAccountInput = {
         email: email.trim(),
         imapUser: imapUser.trim() || null,
-        provider: preset?.provider ?? "custom",
+        provider: protocol === "pop3" ? "pop3" : (preset?.provider ?? "custom"),
         imapHost: imapHost.trim(),
         imapPort,
         smtpHost: smtpHost.trim(),
@@ -227,12 +241,33 @@
   </button>
   {#if showAdvanced}
     <div class="grid">
+      <div class="wide protocol">
+        <button
+          type="button"
+          class="protocol-tab"
+          class:active={protocol === "imap"}
+          onclick={() => chooseProtocol("imap")}
+        >
+          IMAP
+        </button>
+        <button
+          type="button"
+          class="protocol-tab"
+          class:active={protocol === "pop3"}
+          onclick={() => chooseProtocol("pop3")}
+        >
+          POP3
+        </button>
+      </div>
+      {#if protocol === "pop3"}
+        <div class="wide hint">{t("onb.pop3_note")}</div>
+      {/if}
       <label class="wide">
         <span class="microlabel">{t("onb.username")}</span>
         <input bind:value={imapUser} placeholder={email} spellcheck="false" autocomplete="off" />
       </label>
       <label>
-        <span class="microlabel">{t("onb.imap_host")}</span>
+        <span class="microlabel">{t(protocol === "pop3" ? "onb.pop3_host" : "onb.imap_host")}</span>
         <input bind:value={imapHost} spellcheck="false" />
       </label>
       <label class="narrow">
@@ -623,6 +658,23 @@
   }
   .wide {
     grid-column: 1 / -1;
+  }
+  .protocol {
+    display: flex;
+    gap: 6px;
+  }
+  .protocol-tab {
+    padding: 5px 12px;
+    border-radius: var(--radius-s);
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+  .protocol-tab:hover {
+    background: var(--hover);
+  }
+  .protocol-tab.active {
+    background: var(--hover);
+    color: var(--text);
   }
 
   .error {

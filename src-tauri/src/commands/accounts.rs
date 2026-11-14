@@ -1,7 +1,7 @@
 use crate::db::accounts as db_accounts;
 use crate::db::models::Account;
 use crate::error::{Result, SkimError};
-use crate::mail::{autoconfig, imap_client, oauth, sync};
+use crate::mail::{autoconfig, imap_client, local_store, oauth, pop3_client};
 use crate::secrets;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
@@ -109,7 +109,7 @@ async fn finish_add_account(
         return Err(e);
     }
 
-    let handle = sync::spawn(
+    let handle = crate::mail::spawn_engine(
         app.clone(),
         state.db.clone(),
         account.clone(),
@@ -140,8 +140,16 @@ pub async fn add_account(
         .filter(|s| !s.is_empty() && *s != input.email)
         .map(str::to_string);
     let user = imap_user.as_deref().unwrap_or(input.email.as_str());
-    let session = imap_client::login(&input.imap_host, input.imap_port, user, &creds).await?;
-    drop(session); // connection verified; the sync engine opens its own
+    if input.provider == local_store::POP3 {
+        // POP3 account (fork addition): the host/port fields carry the POP3
+        // server, and the login is verified over POP3 instead.
+        let mut session =
+            pop3_client::login(&input.imap_host, input.imap_port, user, &password).await?;
+        session.quit().await;
+    } else {
+        let session = imap_client::login(&input.imap_host, input.imap_port, user, &creds).await?;
+        drop(session); // connection verified; the sync engine opens its own
+    }
 
     let account = Account {
         id: uuid::Uuid::new_v4().to_string(),

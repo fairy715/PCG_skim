@@ -291,7 +291,7 @@ pub fn run() {
                 };
                 let mut engines = state.engines.lock().await;
                 for account in accounts {
-                    let sync_handle = mail::sync::spawn(
+                    let sync_handle = mail::spawn_engine(
                         handle.clone(),
                         state.db.clone(),
                         account.clone(),

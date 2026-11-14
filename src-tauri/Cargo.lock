@@ -2987,6 +2987,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "outlook-pst-fixed"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b10f68c37497f8c186106dee0f764500a06bfbbc1d5d1eb21a7d351a78eb9bbe"
+dependencies = [
+ "byteorder",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "pango"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4186,6 +4197,7 @@ dependencies = [
  "lettre",
  "lopdf",
  "mail-parser",
+ "outlook-pst-fixed",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",

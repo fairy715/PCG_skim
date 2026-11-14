@@ -358,7 +358,7 @@ fn decode_utf16(bytes: &[u8]) -> String {
 
 /// Decode an 8-bit string: UTF-8 when it is valid UTF-8 (which covers plain
 /// ASCII), otherwise the wrapper's declared Windows code page.
-fn decode_string8(bytes: &[u8], codepage: u32) -> String {
+pub(crate) fn decode_string8(bytes: &[u8], codepage: u32) -> String {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
     if let Ok(s) = std::str::from_utf8(bytes) {
@@ -374,8 +374,18 @@ fn encoding_for(codepage: u32) -> &'static encoding_rs::Encoding {
         874 => WINDOWS_874,
         932 => SHIFT_JIS,
         936 => GBK,
-        949 => EUC_KR,
+        949 | 51949 => EUC_KR,
         950 => BIG5,
+        866 => IBM866,
+        20866 => KOI8_R,
+        21866 => KOI8_U,
+        28592 => ISO_8859_2,
+        28595 => ISO_8859_5,
+        28597 => ISO_8859_7,
+        28605 => ISO_8859_15,
+        50220..=50222 => ISO_2022_JP,
+        51932 => EUC_JP,
+        54936 => GB18030,
         1250 => WINDOWS_1250,
         1251 => WINDOWS_1251,
         1253 => WINDOWS_1253,

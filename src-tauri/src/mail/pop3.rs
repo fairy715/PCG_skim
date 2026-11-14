@@ -37,6 +37,7 @@ const MAX_ATTEMPTS: i64 = 5;
 /// Kept out of the numbered migrations on purpose: those belong to upstream,
 /// and a fork-owned number would collide with its next one.
 pub fn ensure_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    local_store::ensure_schema(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pop3_seen (
            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

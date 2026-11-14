@@ -55,6 +55,12 @@ base64 = "0.22"
 # Already linked via lopdf and mail-parser; named here for decoding the 8-bit
 # code-page strings inside winmail.dat (TNEF) wrappers.
 encoding_rs = "0.8"
+# PST import. This is Microsoft's `outlook-pst` 1.2.0 plus two small reader
+# fixes for files Outlook really writes (a message with no recipients or
+# attachments has no sub-node tree; a stale free-count in a heap page). The
+# diff against upstream was read in full; the version is pinned exactly so it
+# cannot change underneath us. Switch back once upstream ships the fixes.
+outlook-pst = { package = "outlook-pst-fixed", version = "=1.2.0" }
 url = "2"
 # 0.11 matches the copy lopdf already pulls in — one build of sha2, not two.
 sha2 = "0.11"

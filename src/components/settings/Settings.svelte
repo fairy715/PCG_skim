@@ -1,9 +1,10 @@
 <script lang="ts">
   import { getVersion } from "@tauri-apps/api/app";
+  import { listen } from "@tauri-apps/api/event";
   import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { aiApi, aiStream, api, credentialStoreError, errorMessage } from "../../lib/api";
-  import type { AiModel, AiProvider } from "../../lib/api";
+  import type { AiModel, AiProvider, ImportProgress } from "../../lib/api";
   import { backdropClose } from "../../lib/backdrop";
   import { LOCALES, getLocale, setLocale, t, type Locale } from "../../lib/i18n/index.svelte";
   import { createOllamaDetection, ollamaV1 } from "../../lib/ollama-detect.svelte";
@@ -506,6 +507,51 @@
     addingAccount = false;
     await mail.accountAdded(account);
   }
+
+  // ---- PST import (fork addition) ----------------------------------------
+  // Progress per archive account. Filled from the backend on open, so a
+  // settings view opened mid-import shows where it is, then kept live.
+  let imports = $state<Record<string, ImportProgress>>({});
+  let importBusy = $state(false);
+  let importError = $state("");
+
+  $effect(() => {
+    void api
+      .pstImportStatus()
+      .then((list) => {
+        for (const p of list) imports[p.accountId] = p;
+      })
+      .catch(() => {});
+    const unlisten = listen<ImportProgress>("import:progress", (e) => {
+      imports[e.payload.accountId] = e.payload;
+    });
+    return () => void unlisten.then((stop) => stop());
+  });
+
+  async function importPst() {
+    importBusy = true;
+    importError = "";
+    try {
+      const account = await api.importPst();
+      if (account && !mail.accounts.some((a) => a.id === account.id)) {
+        await mail.accountAdded(account);
+      }
+    } catch (e) {
+      importError = errorMessage(e);
+    } finally {
+      importBusy = false;
+    }
+  }
+
+  function importLine(p: ImportProgress): string {
+    const n = (v: number) => v.toLocaleString();
+    if (p.phase === "running") {
+      return t("settings.import_running", { done: n(p.done), total: n(p.total) });
+    }
+    if (p.phase === "done") return t("settings.import_done", { count: n(p.imported) });
+    if (p.phase === "cancelled") return t("settings.import_stopped", { count: n(p.imported) });
+    return t("settings.import_failed", { message: p.message ?? "" });
+  }
 </script>
 
 <!-- A binary on/off setting: label on the left, sliding switch on the right. -->
@@ -592,6 +638,16 @@
                      becomes the identifying detail; the host moves into the
                      panel below, where it is still one click away. -->
                 <div class="dim">{account.displayName ? account.email : account.imapHost}</div>
+                {#if imports[account.id]}
+                  <div class="dim">
+                    {importLine(imports[account.id])}
+                    {#if imports[account.id].phase === "running"}
+                      <button class="import-stop" onclick={() => void api.cancelPstImport(account.id)}>
+                        {t("settings.import_stop")}
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
               </div>
               {#if confirmingRemoveId === account.id}
                 <button class="danger" onclick={() => removeAccount(account.id)}>{t("settings.confirm_remove")}</button>
@@ -644,6 +700,12 @@
           <button class="ghost add-btn" onclick={() => (addingAccount = true)}>
             + {t("settings.add_account")}
           </button>
+          <button class="ghost add-btn" onclick={importPst} disabled={importBusy}>
+            + {t("settings.import_pst")}
+          </button>
+          {#if importError}
+            <div class="dim">{importError}</div>
+          {/if}
         </section>
       {/if}
 
@@ -1156,6 +1218,15 @@
 
   .add-btn {
     align-self: flex-start;
+  }
+  .import-stop {
+    margin-left: 8px;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    color: var(--text-dim);
+  }
+  .import-stop:hover {
+    color: var(--text);
   }
   .add-account .ghost {
     align-self: flex-start;

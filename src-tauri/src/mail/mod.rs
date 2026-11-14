@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod autoconfig;
 pub mod dns;
 pub mod ics;
@@ -8,6 +9,7 @@ pub mod oauth;
 pub mod parse;
 pub mod pop3;
 pub mod pop3_client;
+pub mod pst_import;
 pub mod sanitize;
 pub mod smtp;
 pub mod suspicion;
@@ -17,7 +19,8 @@ pub mod tnef;
 pub mod translate;
 
 /// Start the engine that matches the account's kind: POP3 accounts get the
-/// download-only engine, everything else the IMAP sync engine. Fork addition —
+/// download-only engine, local archives the offline one, everything else the
+/// IMAP sync engine. Fork addition —
 /// the one place that decides, so callers never look at the provider.
 pub fn spawn_engine(
     app: tauri::AppHandle,
@@ -27,6 +30,8 @@ pub fn spawn_engine(
 ) -> sync::SyncHandle {
     if account.provider == local_store::POP3 {
         pop3::spawn(app, db, account, data_dir)
+    } else if account.provider == local_store::ARCHIVE {
+        archive::spawn(app, db, account, data_dir)
     } else {
         sync::spawn(app, db, account, data_dir)
     }

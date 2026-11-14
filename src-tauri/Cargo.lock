@@ -4179,6 +4179,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
+ "encoding_rs",
  "futures",
  "getrandom 0.3.4",
  "keyring",

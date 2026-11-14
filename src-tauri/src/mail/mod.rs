@@ -13,6 +13,7 @@ pub mod smtp;
 pub mod suspicion;
 pub mod sync;
 pub mod threading;
+pub mod tnef;
 pub mod translate;
 
 /// Start the engine that matches the account's kind: POP3 accounts get the

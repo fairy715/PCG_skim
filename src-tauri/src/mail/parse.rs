@@ -233,7 +233,7 @@ fn extract_body(parsed: &mail_parser::Message<'_>) -> ParsedBody {
 
     let snippet = text.as_deref().map(make_snippet).unwrap_or_default();
 
-    let attachments = parsed
+    let attachments: Vec<ParsedAttachment> = parsed
         .attachments()
         .map(|part| {
             let content_type = part.content_type();
@@ -253,12 +253,60 @@ fn extract_body(parsed: &mail_parser::Message<'_>) -> ParsedBody {
         })
         .collect();
 
-    ParsedBody {
+    unwrap_tnef(ParsedBody {
         text,
         html,
         snippet,
         attachments,
+    })
+}
+
+/// Replace Outlook's `winmail.dat` wrapper with the files inside it (fork
+/// addition, see [`crate::mail::tnef`]). The wrapper is recognised by its
+/// content, not its name — it travels under several names and MIME types.
+///
+/// It is dropped once it has given something up, or when the message has a
+/// body anyway: what is left in it then is rich-text formatting nobody can
+/// open. A wrapper that yields nothing on a message with no body is kept, so
+/// that the only trace of the content is never thrown away.
+fn unwrap_tnef(mut body: ParsedBody) -> ParsedBody {
+    if !body
+        .attachments
+        .iter()
+        .any(|a| crate::mail::tnef::is_tnef(&a.data))
+    {
+        return body;
     }
+    let mut attachments = Vec::with_capacity(body.attachments.len());
+    for wrapper in std::mem::take(&mut body.attachments) {
+        let Some(tnef) = crate::mail::tnef::decode(&wrapper.data) else {
+            attachments.push(wrapper);
+            continue;
+        };
+        if body.html.is_none() && body.text.is_none() {
+            body.html = tnef.html;
+            body.text = tnef.text.or_else(|| body.html.as_deref().map(html_to_text));
+            if let Some(text) = &body.text {
+                body.snippet = make_snippet(text);
+            }
+        }
+        let has_body = body.html.is_some() || body.text.is_some();
+        if tnef.attachments.is_empty() && !has_body {
+            attachments.push(wrapper);
+            continue;
+        }
+        attachments.extend(tnef.attachments.into_iter().map(|a| ParsedAttachment {
+            size: a.data.len() as i64,
+            // Inline only when the message's HTML can actually refer to it.
+            is_inline: a.content_id.is_some() && body.html.is_some(),
+            filename: a.filename,
+            mime_type: a.mime_type,
+            content_id: a.content_id,
+            data: a.data,
+        }));
+    }
+    body.attachments = attachments;
+    body
 }
 
 /// Cheap HTML → text for FTS/snippets when a message has no text part.
@@ -966,5 +1014,89 @@ mod tests {
     fn html_to_text_strips_uppercase_script_and_style() {
         let html = "<SCRIPT>alert(1)</SCRIPT>hello <STYLE>b{}</STYLE>world";
         assert_eq!(html_to_text(html), "hello world");
+    }
+}
+
+#[cfg(test)]
+mod tnef_tests {
+    use super::*;
+    use crate::mail::tnef::testing::{attribute, one_file, stream};
+    use base64::Engine;
+
+    /// A multipart message as Outlook sends it: a text part (optional) and the
+    /// wrapper as an `application/ms-tnef` attachment.
+    fn message(text: Option<&str>, wrapper: &[u8], extra_part: &str) -> Vec<u8> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wrapper);
+        let text_part = text
+            .map(|t| format!("--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{t}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "From: a@example.com\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+             {text_part}\
+             --b\r\nContent-Type: application/ms-tnef; name=\"winmail.dat\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             Content-Disposition: attachment; filename=\"winmail.dat\"\r\n\r\n\
+             {b64}\r\n{extra_part}--b--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_wrapper_is_replaced_by_the_files_inside_it() {
+        let raw = message(Some("See attached."), &one_file("報告.xlsx", b"sheet"), "");
+        let body = parse_body(&raw);
+        assert_eq!(body.text.as_deref().map(str::trim), Some("See attached."));
+        assert_eq!(body.attachments.len(), 1);
+        let a = &body.attachments[0];
+        assert_eq!(a.filename.as_deref(), Some("報告.xlsx"));
+        assert_eq!(a.data, b"sheet");
+        assert_eq!(a.size, 5);
+        assert!(!a.is_inline);
+    }
+
+    #[test]
+    fn ordinary_attachments_next_to_the_wrapper_are_kept() {
+        let extra = "--b\r\nContent-Type: text/csv; name=\"data.csv\"\r\n\
+                     Content-Disposition: attachment; filename=\"data.csv\"\r\n\r\na,b\r\n";
+        let raw = message(Some("Hi"), &one_file("inside.pdf", b"pdf"), extra);
+        let mut names: Vec<_> = parse_body(&raw)
+            .attachments
+            .into_iter()
+            .filter_map(|a| a.filename)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["data.csv", "inside.pdf"]);
+    }
+
+    #[test]
+    fn a_formatting_only_wrapper_disappears_when_there_is_a_body() {
+        let raw = message(Some("Just text."), &stream(&[]), "");
+        assert!(parse_body(&raw).attachments.is_empty());
+    }
+
+    #[test]
+    fn a_wrapper_that_yields_nothing_is_kept_when_it_is_all_there_is() {
+        let raw = message(None, &stream(&[]), "");
+        let body = parse_body(&raw);
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].filename.as_deref(), Some("winmail.dat"));
+    }
+
+    #[test]
+    fn the_wrapper_supplies_the_body_when_the_message_has_none() {
+        let wrapper = stream(&[attribute(1, 0x800C, b"Body from the wrapper\0")]);
+        let body = parse_body(&message(None, &wrapper, ""));
+        assert_eq!(body.text.as_deref(), Some("Body from the wrapper"));
+        assert_eq!(body.snippet, "Body from the wrapper");
+        assert!(body.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_file_merely_named_winmail_dat_is_left_alone() {
+        let raw = message(Some("Hi"), b"not a tnef stream at all", "");
+        let body = parse_body(&raw);
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].data, b"not a tnef stream at all");
     }
 }

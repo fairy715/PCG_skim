@@ -36,6 +36,8 @@
   "onb.ms_unverified_note": "Microsoft may label Skim \"unverified\" — sign-in still works.",
   "onb.advanced": "Server settings",
   "onb.imap_host": "IMAP host",
+  "onb.pop3_host": "POP3 host",
+  "onb.pop3_note": "POP3 downloads mail to this computer and leaves it on the server. Read, archive and delete are kept on this computer only.",
   "onb.username": "Username",
   "onb.smtp_host": "SMTP host",
   "onb.port": "Port",

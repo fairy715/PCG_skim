@@ -36,6 +36,8 @@
   "onb.ms_unverified_note": "Microsoft 可能會將 Skim 標示為「未驗證」——仍可正常登入。",
   "onb.advanced": "伺服器設定",
   "onb.imap_host": "IMAP 主機",
+  "onb.pop3_host": "POP3 主機",
+  "onb.pop3_note": "POP3 會把郵件下載到這台電腦，伺服器上的郵件不會刪除。已讀、封存與刪除只記錄在這台電腦。",
   "onb.username": "使用者名稱",
   "onb.smtp_host": "SMTP 主機",
   "onb.port": "連接埠",

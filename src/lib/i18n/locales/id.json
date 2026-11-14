@@ -36,6 +36,8 @@
   "onb.ms_unverified_note": "Microsoft mungkin menandai Skim sebagai \"belum diverifikasi\" — proses masuk tetap berfungsi.",
   "onb.advanced": "Pengaturan server",
   "onb.imap_host": "Host IMAP",
+  "onb.pop3_host": "Host POP3",
+  "onb.pop3_note": "POP3 mengunduh email ke komputer ini dan membiarkannya tetap di server. Status dibaca, arsip, dan hapus hanya disimpan di komputer ini.",
   "onb.username": "Nama pengguna",
   "onb.smtp_host": "Host SMTP",
   "onb.port": "Port",

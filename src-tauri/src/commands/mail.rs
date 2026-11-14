@@ -489,6 +489,11 @@ async fn queue_op(
     extra: serde_json::Value,
     local: impl FnOnce(&mut rusqlite::Connection, &[i64]) -> rusqlite::Result<()> + Send + 'static,
 ) -> Result<()> {
+    // Local-only accounts (POP3) have no server to move mail on: their messages
+    // are relocated right here, and only what is left goes down the IMAP path.
+    let message_ids =
+        crate::mail::local_store::intercept(&state.db, &state.data_dir, message_ids, kind, &extra)
+            .await?;
     let ids = message_ids.clone();
     let account_ids: Vec<String> = state
         .db

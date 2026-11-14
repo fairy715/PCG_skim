@@ -32,7 +32,22 @@ export interface OauthAvailability {
   verified: boolean;
 }
 
+/** Running totals of a PST import (fork addition), from `import:progress`. */
+export interface ImportProgress {
+  accountId: string;
+  phase: "running" | "done" | "cancelled" | "error";
+  total: number;
+  done: number;
+  imported: number;
+  failed: number;
+  message: string | null;
+}
+
 export const api = {
+  // PST import: picks a file, returns the archive account (null if cancelled).
+  importPst: () => invoke<Account | null>("import_pst"),
+  cancelPstImport: (accountId: string) => invoke<void>("cancel_pst_import", { accountId }),
+  pstImportStatus: () => invoke<ImportProgress[]>("pst_import_status"),
   // accounts
   autoconfigLookup: (email: string) =>
     invoke<ServerPreset | null>("autoconfig_lookup", { email }),

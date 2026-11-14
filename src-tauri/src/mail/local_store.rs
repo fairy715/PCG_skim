@@ -24,9 +24,11 @@ use std::path::Path;
 
 /// Account `provider` values whose mail lives only in the local database.
 pub const POP3: &str = "pop3";
+/// An archive with no server at all — mail imported from a file (PST).
+pub const ARCHIVE: &str = "local";
 
 pub fn is_local_provider(provider: &str) -> bool {
-    provider == POP3
+    provider == POP3 || provider == ARCHIVE
 }
 
 /// The fixed folder set of a local mailbox: `(name, role, sort order)`. The
@@ -39,16 +41,25 @@ const FOLDERS: &[(&str, &str, i64)] = &[
     ("Trash", "trash", 4),
 ];
 
-/// Create the standard folders of a local account if they are missing.
+/// Create the standard folders of a local account if they are missing. Keyed
+/// on the role, not the name: an imported archive brings its own "Deleted
+/// Items" or "寄件備份", and must not end up with a second trash next to it.
 pub fn ensure_folders(conn: &Connection, account_id: &str) -> rusqlite::Result<()> {
     for (name, role, sort_order) in FOLDERS {
         conn.execute(
             "INSERT OR IGNORE INTO folders (account_id, imap_name, role, display_name, sort_order)
-             VALUES (?1, ?2, ?3, ?2, ?4)",
+             SELECT ?1, ?2, ?3, ?2, ?4
+             WHERE NOT EXISTS (SELECT 1 FROM folders WHERE account_id = ?1 AND role = ?3)",
             params![account_id, name, role, sort_order],
         )?;
     }
     Ok(())
+}
+
+/// Sort position of a folder with the given role, matching [`ensure_folders`].
+pub fn role_sort_order(role: Option<&str>) -> i64 {
+    role.and_then(|r| FOLDERS.iter().find(|(_, role, _)| *role == r))
+        .map_or(100, |(_, _, order)| *order)
 }
 
 /// This account's folder with the given role.
@@ -95,20 +106,32 @@ pub fn store_raw(
     raw: &[u8],
     is_read: bool,
 ) -> Result<Option<i64>> {
-    let uid = next_uid(conn, folder_id)?;
     let size = u32::try_from(raw.len()).ok();
-    let mut msg = parse::parse_headers(
-        account_id, folder_id, uid, raw, None, size, is_read, false, false,
+    let msg = parse::parse_headers(
+        account_id, folder_id, 0, raw, None, size, is_read, false, false,
     );
+    store_message(conn, data_dir, msg, parse::parse_body(raw))
+}
+
+/// Write one already-parsed message into a local folder. `msg.account_id` and
+/// `msg.folder_id` say where; its `uid` is assigned here. This is the entry
+/// point for sources that are not RFC 822 to begin with (a PST import builds
+/// the two halves straight from MAPI properties).
+pub fn store_message(
+    conn: &mut Connection,
+    data_dir: &Path,
+    mut msg: crate::db::models::NewMessage,
+    parsed: parse::ParsedBody,
+) -> Result<Option<i64>> {
+    msg.uid = next_uid(conn, msg.folder_id)?;
     if msg.date <= 0 {
-        // No usable Date header: arrival time is the best remaining answer.
+        // No usable date: arrival time is the best remaining answer.
         msg.date = now_unix();
     }
     let Some((message_pk, _thread)) = queries::insert_message(conn, &msg)? else {
         return Ok(None);
     };
 
-    let parsed = parse::parse_body(raw);
     let dir = data_dir.join("attachments").join(message_pk.to_string());
     let _ = std::fs::remove_dir_all(&dir);
     if !parsed.attachments.is_empty() {
@@ -116,19 +139,7 @@ pub fn store_raw(
     }
     let mut stored = Vec::with_capacity(parsed.attachments.len());
     for (i, a) in parsed.attachments.iter().enumerate() {
-        let safe_name: String = a
-            .filename
-            .as_deref()
-            .unwrap_or("attachment")
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || ".-_ ()".contains(c) {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_name = safe_file_name(a.filename.as_deref().unwrap_or("attachment"));
         let path = dir.join(format!("{i}_{safe_name}"));
         std::fs::write(&path, &a.data)?;
         stored.push(bodies::StoredAttachment {
@@ -149,6 +160,37 @@ pub fn store_raw(
         &stored,
     )?;
     Ok(Some(message_pk))
+}
+
+/// Longest attachment file name kept on disk. Windows caps a whole path at
+/// 260 characters by default, and the cache directory takes its share.
+const MAX_FILE_NAME_CHARS: usize = 100;
+
+/// A name safe to create inside the attachment cache: nothing a file system
+/// reserves, and short enough that a sender's 300-character file name cannot
+/// make the write fail. The extension survives the cut.
+fn safe_file_name(name: &str) -> String {
+    let clean: Vec<char> = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || ".-_ ()".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.len() <= MAX_FILE_NAME_CHARS {
+        return clean.into_iter().collect();
+    }
+    let ext_start = clean
+        .iter()
+        .rposition(|c| *c == '.')
+        .filter(|dot| clean.len() - dot <= 12)
+        .unwrap_or(clean.len());
+    let ext = &clean[ext_start..];
+    let keep = MAX_FILE_NAME_CHARS - ext.len();
+    clean[..keep].iter().chain(ext).collect()
 }
 
 /// Where a local mutation sends its messages.
@@ -352,6 +394,21 @@ Date: Tue, 03 Mar 2026 10:00:00 +0000\r\n\r\nFirst line of the body.\r\n";
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn file_names_are_made_safe_and_kept_short() {
+        assert_eq!(safe_file_name("報告 (final).xlsx"), "報告 (final).xlsx");
+        assert_eq!(safe_file_name("a/b\\c:d*.txt"), "a_b_c_d_.txt");
+        let long = format!("{}.pdf", "x".repeat(400));
+        let safe = safe_file_name(&long);
+        assert_eq!(safe.chars().count(), MAX_FILE_NAME_CHARS);
+        assert!(safe.ends_with(".pdf"));
+        // No extension worth keeping: just cut.
+        assert_eq!(
+            safe_file_name(&"y".repeat(400)).chars().count(),
+            MAX_FILE_NAME_CHARS
+        );
     }
 
     #[test]

@@ -31,6 +31,30 @@ pub fn is_local_provider(provider: &str) -> bool {
     provider == POP3 || provider == ARCHIVE
 }
 
+/// Schema that local mailboxes need on top of upstream's. Created on demand
+/// rather than through a numbered migration, so upstream's next migration
+/// number stays free.
+///
+/// Both indexes exist for bulk loads. Upstream's schema is sized for an IMAP
+/// cache — a few hundred messages a folder — and two of the lookups made for
+/// every stored message walk far more than they need once there are a hundred
+/// thousand, which made a large import quadratic:
+///
+/// - `queries::recompute_folder_unread` counts a folder's unread mail by
+///   walking the whole folder. Indexing only the unread rows makes the count
+///   cost what it counts.
+/// - `threading::subject_fallback` looks for a thread with the same subject
+///   by walking every thread of the account. Indexing the subject makes it a
+///   lookup.
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_pcg_messages_folder_unread
+           ON messages(folder_id) WHERE is_read = 0;
+         CREATE INDEX IF NOT EXISTS idx_pcg_threads_subject
+           ON threads(account_id, subject_norm, last_date);",
+    )
+}
+
 /// The fixed folder set of a local mailbox: `(name, role, sort order)`. The
 /// name doubles as `imap_name`, which for a local account is just a stable key.
 const FOLDERS: &[(&str, &str, i64)] = &[
@@ -394,6 +418,41 @@ Date: Tue, 03 Mar 2026 10:00:00 +0000\r\n\r\nFirst line of the body.\r\n";
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn plan(db: &Db, sql: &'static str) -> String {
+        db.with(|conn| {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(3))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.join("\n"))
+        })
+        .unwrap()
+    }
+
+    /// The two per-message lookups that made a large import quadratic must
+    /// stay index seeks. The SQL is the shape used by
+    /// `queries::recompute_folder_unread` and `threading::subject_fallback`.
+    #[test]
+    fn bulk_load_lookups_use_their_indexes() {
+        let db = db_with_account(POP3);
+        db.with(|conn| ensure_schema(conn)).unwrap();
+        let unread = plan(
+            &db,
+            "SELECT count(*) FROM messages WHERE folder_id = 1 AND is_read = 0",
+        );
+        assert!(
+            unread.contains("idx_pcg_messages_folder_unread"),
+            "{unread}"
+        );
+        let subject = plan(
+            &db,
+            "SELECT id FROM threads
+             WHERE account_id = 'acc' AND subject_norm = 'x' AND abs(last_date - 5) <= 9
+             ORDER BY last_date DESC LIMIT 8",
+        );
+        assert!(subject.contains("idx_pcg_threads_subject"), "{subject}");
     }
 
     #[test]

@@ -546,6 +546,7 @@ fn convert(
 /// Create the tables an import needs. Outside the numbered migrations on
 /// purpose, like `pop3_seen`: those numbers belong to upstream.
 pub fn ensure_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    local_store::ensure_schema(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pst_imported (
            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -1237,13 +1238,26 @@ mod tests {
         })
         .unwrap();
         let started = std::time::Instant::now();
-        let p = run(
+        // Rate per slice, so a slowdown as the database grows is visible.
+        let mut lap = (std::time::Instant::now(), 0u64);
+        let p = run_with(
             &db,
             &dir,
             "arc",
             Path::new(&path),
             &AtomicBool::new(false),
-            |_| {},
+            5000,
+            |p| {
+                let secs = lap.0.elapsed().as_secs_f64().max(0.001);
+                if p.imported > lap.1 {
+                    println!(
+                        "  at {}: {:.0} msg/s",
+                        p.imported,
+                        (p.imported - lap.1) as f64 / secs
+                    );
+                }
+                lap = (std::time::Instant::now(), p.imported);
+            },
         )
         .unwrap();
         let secs = started.elapsed().as_secs_f64();

@@ -42,7 +42,7 @@
     },
     {
       // Brand name, matching the AI action in ReadingPane — not localized.
-      title: "Skim AI",
+      title: t("settings.ai"),
       rows: [
         { label: t("ai.ask"), keys: ["Q"] },
         { label: t("ai.translate"), keys: ["T"] },

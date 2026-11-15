@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod badge;
+pub mod brand;
 pub mod commands;
 pub mod db;
 pub mod error;
@@ -14,11 +15,15 @@ use state::AppState;
 use std::path::PathBuf;
 use tauri::{Emitter, Manager};
 
-/// Roaming app-data dir (`%APPDATA%\com.skim.app`) — the same place Tauri's
-/// `app_data_dir()` resolves to on Windows, computed without an `AppHandle` so
-/// the panic hook can reach it before setup runs.
+/// Local app-data dir (`%LOCALAPPDATA%\com.pcg.mail`) — the same place Tauri's
+/// `app_local_data_dir()` resolves to on Windows, computed without an
+/// `AppHandle` so the panic hook can reach it before setup runs.
+///
+/// Local, not roaming (fork change): with imported archives the database and
+/// attachment cache run to tens of gigabytes, and a roaming profile would copy
+/// all of it to the server at every sign-out.
 fn app_data_dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("com.skim.app"))
+    std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join(brand::IDENTIFIER))
 }
 
 /// Past this a diagnostic log is old news; the file is started over rather than
@@ -91,7 +96,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // A protocol-activated toast click relaunches Skim with a
             // `skim://…` argument, forwarded here to the running instance.
-            if let Some(uri) = args.iter().find(|a| a.starts_with("skim://")) {
+            if let Some(uri) = args.iter().find(|a| a.starts_with(brand::URL_PREFIX)) {
                 notify::handle_skim_uri(app, uri, true);
             } else {
                 // A plain second launch surfaces the running instance (it may
@@ -208,7 +213,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
+            let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir).ok();
             notify::register_aumid();
             notify::register_url_scheme();
@@ -274,7 +279,7 @@ pub fn run() {
             // Cold start from a toast click: stash the target so the frontend
             // opens it once its listeners attach (via take_pending_open). The
             // running-app case goes through the single-instance handler above.
-            if let Some(uri) = std::env::args().find(|a| a.starts_with("skim://")) {
+            if let Some(uri) = std::env::args().find(|a| a.starts_with(brand::URL_PREFIX)) {
                 notify::handle_skim_uri(app.handle(), &uri, false);
             }
 
@@ -317,7 +322,8 @@ pub fn run() {
                 };
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_lowercase();
-                    if name.starts_with("skim-") && name.contains("-updater-") {
+                    let ours = format!("{}-", brand::NAME.to_lowercase());
+                    if name.starts_with(&ours) && name.contains("-updater-") {
                         let _ = std::fs::remove_dir_all(entry.path());
                     }
                 }
@@ -430,22 +436,24 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     });
 }
 
-fn tray_labels(locale: &str) -> (&'static str, &'static str) {
-    match locale {
-        "ru" => ("Открыть Skim", "Выход"),
-        "de" => ("Skim öffnen", "Beenden"),
-        "fr" => ("Ouvrir Skim", "Quitter"),
-        "es" => ("Abrir Skim", "Salir"),
-        "it" => ("Apri Skim", "Esci"),
-        "pl" => ("Otwórz Skim", "Zakończ"),
-        "sr" => ("Otvori Skim", "Izlaz"),
-        "zh" => ("打开 Skim", "退出"),
-        "zh-TW" => ("開啟 Skim", "結束"),
-        "id" => ("Buka Skim", "Keluar"),
-        "ja" => ("Skim を開く", "終了"),
-        "ko" => ("Skim 열기", "종료"),
-        _ => ("Open Skim", "Quit"),
-    }
+fn tray_labels(locale: &str) -> (String, &'static str) {
+    // `{}` is the app's name; the word order differs by language.
+    let (open, quit) = match locale {
+        "ru" => ("Открыть {}", "Выход"),
+        "de" => ("{} öffnen", "Beenden"),
+        "fr" => ("Ouvrir {}", "Quitter"),
+        "es" => ("Abrir {}", "Salir"),
+        "it" => ("Apri {}", "Esci"),
+        "pl" => ("Otwórz {}", "Zakończ"),
+        "sr" => ("Otvori {}", "Izlaz"),
+        "zh" => ("打开 {}", "退出"),
+        "zh-TW" => ("開啟 {}", "結束"),
+        "id" => ("Buka {}", "Keluar"),
+        "ja" => ("{} を開く", "終了"),
+        "ko" => ("{} 열기", "종료"),
+        _ => ("Open {}", "Quit"),
+    };
+    (open.replace("{}", brand::NAME), quit)
 }
 
 fn setup_tray(app: &tauri::AppHandle, locale: &str) -> tauri::Result<()> {
@@ -459,7 +467,7 @@ fn setup_tray(app: &tauri::AppHandle, locale: &str) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().expect("bundled icon").clone())
-        .tooltip("Skim")
+        .tooltip(brand::NAME)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

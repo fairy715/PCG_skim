@@ -11,8 +11,8 @@ use windows::core::HSTRING;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 
-const AUMID: &str = "com.skim.app";
-const URL_SCHEME: &str = "skim";
+const AUMID: &str = crate::brand::IDENTIFIER;
+const URL_SCHEME: &str = crate::brand::URL_SCHEME;
 
 /// Where the toast icon lives. The notification platform silently drops
 /// images under hidden directories — the whole AppData tree included — so
@@ -21,7 +21,7 @@ pub fn toast_icon_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("USERPROFILE").ok()?;
     Some(
         std::path::Path::new(&home)
-            .join(".skim")
+            .join(crate::brand::PROFILE_DIR)
             .join("notify-icon.png"),
     )
 }
@@ -58,7 +58,7 @@ pub fn register_aumid() {
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok((key, _)) = hkcu.create_subkey(format!(r"Software\Classes\AppUserModelId\{AUMID}")) {
-        let _ = key.set_raw_value("DisplayName", &expand_sz("Skim"));
+        let _ = key.set_raw_value("DisplayName", &expand_sz(crate::brand::NAME));
         let _ = key.set_raw_value("IconUri", &expand_sz(&icon_path.to_string_lossy()));
     }
 }
@@ -193,7 +193,7 @@ pub async fn notify_new_mail(app: &AppHandle, db: &Db, message_pks: &[i64]) {
     let title = from_name
         .filter(|s| !s.is_empty())
         .or(from_addr)
-        .unwrap_or_else(|| "Skim".into());
+        .unwrap_or_else(|| crate::brand::NAME.into());
     let mut body = subject.unwrap_or_default();
     if message_pks.len() > 1 {
         body.push_str(&format!("  (+{})", message_pks.len() - 1));
@@ -206,11 +206,13 @@ pub async fn notify_new_mail(app: &AppHandle, db: &Db, message_pks: &[i64]) {
         .join(",");
     let open_uri = match open_target {
         Some((folder_id, thread_id, message_id)) => {
-            format!("skim://open?folder={folder_id}&thread={thread_id}&message={message_id}")
+            format!(
+                "{URL_SCHEME}://open?folder={folder_id}&thread={thread_id}&message={message_id}"
+            )
         }
-        None => "skim://open".to_string(),
+        None => format!("{URL_SCHEME}://open"),
     };
-    let read_uri = format!("skim://read?ids={ids_csv}");
+    let read_uri = format!("{URL_SCHEME}://read?ids={ids_csv}");
     let mark_read = mark_read_label(&locale);
 
     // Protocol-activated toast. A body click launches `open_uri`, the button
@@ -279,7 +281,7 @@ fn xml_escape(s: &str) -> String {
 /// cold-start argv parsing (`frontend_ready = false`, no listener attached
 /// yet — the target is stashed for `take_pending_open`).
 pub fn handle_skim_uri(app: &AppHandle, uri: &str, frontend_ready: bool) {
-    let Some(rest) = uri.strip_prefix("skim://") else {
+    let Some(rest) = uri.strip_prefix(crate::brand::URL_PREFIX) else {
         return;
     };
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));

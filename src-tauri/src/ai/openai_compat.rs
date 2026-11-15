@@ -123,8 +123,8 @@ fn post_chat(ep: &Endpoint, key: &str, body: &serde_json::Value) -> reqwest::Req
     if ep.attribution {
         // Attribution headers recommended by OpenRouter.
         req = req
-            .header("HTTP-Referer", "https://github.com/nikserg/skim")
-            .header("X-Title", "Skim");
+            .header("HTTP-Referer", crate::brand::HOMEPAGE)
+            .header("X-Title", crate::brand::NAME);
     }
     req.json(body)
 }

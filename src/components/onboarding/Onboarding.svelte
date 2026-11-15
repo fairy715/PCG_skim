@@ -106,7 +106,7 @@
           <rect x="25" y="39" width="46" height="8.5" rx="4.25" fill="#0d0d10" />
           <rect x="25" y="55" width="29" height="8.5" rx="4.25" fill="#0d0d10" fill-opacity="0.55" />
         </svg>
-        Skim
+        {t("app.name")}
       </div>
       <h1>
         {t("onb.tagline_1")}<br />

@@ -266,7 +266,7 @@ pub fn chat_agent(now: &str, locale: &str, has_context: bool, horizon: Option<&s
         None => String::new(),
     };
     format!(
-        "You are Skim's mailbox assistant, helping the user with questions about their entire \
+        "You are PCG Mail's mailbox assistant, helping the user with questions about their entire \
          mailbox. You have three tools: `search_emails` (find emails by keyword, sender, subject, \
          folder, date range, and read/starred state), `read_email` (read a search result's \
          full body by its [N] number — pass thread=true for the whole conversation), and \
@@ -306,7 +306,7 @@ pub fn recap(
     locale: &str,
 ) -> (String, String) {
     let system = format!(
-        "You are Skim's mailbox assistant. The user just opened their inbox and \
+        "You are PCG Mail's mailbox assistant. The user just opened their inbox and \
          wants to catch up without reading everything. {} {}",
         now_block(now),
         locale_line(locale)

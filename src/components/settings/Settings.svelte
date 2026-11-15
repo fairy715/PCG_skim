@@ -1085,8 +1085,8 @@
       </section>
 
       <div class="about microlabel">
-        Skim{appVersion ? ` v${appVersion}` : ""} · {t("onb.footer")} · MIT ·
-        <button class="gh-link" onclick={() => openUrl("https://github.com/nikserg/skim")}>
+        {t("app.name")}{appVersion ? ` v${appVersion}` : ""} · {t("onb.footer")} · MIT ·
+        <button class="gh-link" onclick={() => openUrl("https://github.com/fairy715/pcg_skim")}>
           GitHub
         </button>
       </div>

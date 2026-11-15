@@ -122,6 +122,12 @@ fn decode_at(data: &[u8], depth: u8) -> Option<Tnef> {
     // Title from the legacy attribute — the MAPI long filename, when present,
     // is the real name and wins.
     let mut legacy_title: Option<String> = None;
+    // The attachment in hand was an attached message whose own files were
+    // already listed; the shell around them is not a file of its own.
+    let mut expanded = false;
+    // Content for the attachment in hand actually arrived — possibly empty.
+    // A name whose content never came (a cut-short stream) is not a file.
+    let mut has_data = false;
 
     // Every `?`-like exit below is a `break`: whatever was complete is kept.
     while let Some(level) = r.u8() {
@@ -173,7 +179,15 @@ fn decode_at(data: &[u8], depth: u8) -> Option<Tnef> {
                 }
             }
             (LVL_ATTACHMENT, ATT_ATTACH_RENDDATA) => {
-                finish(&mut out, current.take(), legacy_title.take());
+                finish(
+                    &mut out,
+                    current.take(),
+                    legacy_title.take(),
+                    expanded,
+                    has_data,
+                );
+                expanded = false;
+                has_data = false;
                 current = Some(TnefAttachment::default());
             }
             (LVL_ATTACHMENT, ATT_ATTACH_TITLE) => {
@@ -182,6 +196,7 @@ fn decode_at(data: &[u8], depth: u8) -> Option<Tnef> {
             }
             (LVL_ATTACHMENT, ATT_ATTACH_DATA) => {
                 current.get_or_insert_with(TnefAttachment::default).data = value.to_vec();
+                has_data = true;
             }
             (LVL_ATTACHMENT, ATT_ATTACHMENT) => {
                 let att = current.get_or_insert_with(TnefAttachment::default);
@@ -194,12 +209,26 @@ fn decode_at(data: &[u8], depth: u8) -> Option<Tnef> {
                         (PR_ATTACH_CONTENT_ID, v) => att.content_id = v.into_text(codepage),
                         (PR_ATTACH_DATA, PropValue::Bytes(b)) if att.data.is_empty() => {
                             att.data = b;
+                            has_data = true;
                         }
-                        (PR_ATTACH_DATA, PropValue::Object(b)) if depth < MAX_DEPTH => {
-                            // An attached message: itself TNEF. Its own files
-                            // are what the reader is after.
-                            if let Some(inner) = decode_at(&b, depth + 1) {
-                                out.attachments.extend(inner.attachments);
+                        (PR_ATTACH_DATA, PropValue::Object(b)) => {
+                            // An attached message is itself TNEF, and its own
+                            // files are what the reader is after. Any other
+                            // object — an embedded Word or Excel document is an
+                            // OLE compound file — is kept as the file it is.
+                            let inner = (depth < MAX_DEPTH)
+                                .then(|| decode_at(&b, depth + 1))
+                                .flatten();
+                            match inner {
+                                Some(inner) => {
+                                    out.attachments.extend(inner.attachments);
+                                    expanded = true;
+                                }
+                                None if att.data.is_empty() => {
+                                    att.data = b;
+                                    has_data = true;
+                                }
+                                None => {}
                             }
                         }
                         _ => {}
@@ -215,13 +244,19 @@ fn decode_at(data: &[u8], depth: u8) -> Option<Tnef> {
             break;
         }
     }
-    finish(&mut out, current, legacy_title);
+    finish(&mut out, current, legacy_title, expanded, has_data);
     out.attachments.truncate(MAX_ATTACHMENTS);
     Some(out)
 }
 
 /// Close the attachment being assembled and keep it if it carries content.
-fn finish(out: &mut Tnef, current: Option<TnefAttachment>, legacy_title: Option<String>) {
+fn finish(
+    out: &mut Tnef,
+    current: Option<TnefAttachment>,
+    legacy_title: Option<String>,
+    expanded: bool,
+    has_data: bool,
+) {
     let Some(mut att) = current else { return };
     if att.filename.as_deref().is_none_or(|n| n.trim().is_empty()) {
         att.filename = legacy_title;
@@ -235,9 +270,13 @@ fn finish(out: &mut Tnef, current: Option<TnefAttachment>, legacy_title: Option<
         .content_id
         .map(|c| c.trim_matches(['<', '>', ' ']).to_string())
         .filter(|c| !c.is_empty());
-    // An entry with no bytes is a placeholder (an OLE object, an embedded
-    // message we unpacked separately) — not something a user can open.
-    if !att.data.is_empty() {
+    // A file the sender attached is listed even when it is empty — Outlook
+    // writes zero-byte files with their name like any other. A name whose
+    // content never arrived is a cut-short stream, not an empty file; an
+    // entry with no name and no bytes is a placeholder; and the shell of an
+    // attached message whose files were listed is not a file at all.
+    let empty_file = has_data && att.filename.is_some();
+    if !expanded && (!att.data.is_empty() || empty_file) {
         out.attachments.push(att);
     }
 }
@@ -606,6 +645,55 @@ mod tests {
         assert_eq!(t.attachments[0].filename.as_deref(), Some("inner.pdf"));
     }
 
+    /// Outlook embeds a pasted Office document as an OLE storage object
+    /// (interface id IStorage, then a compound file). Found in a real sample.
+    #[test]
+    fn an_embedded_document_is_kept_as_a_file() {
+        let mut object = vec![0x0B, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+        object.extend_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 1, 2, 3]);
+        let data = stream(&[
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_RENDDATA, &[0; 14]),
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_TITLE, b"Untitled_Attachment\0"),
+            attribute(
+                LVL_ATTACHMENT,
+                ATT_ATTACHMENT,
+                &props(&[prop_binary(PT_OBJECT, PR_ATTACH_DATA, &object)]),
+            ),
+        ]);
+        let t = decode(&data).unwrap();
+        assert_eq!(t.attachments.len(), 1);
+        let a = &t.attachments[0];
+        assert_eq!(a.filename.as_deref(), Some("Untitled_Attachment"));
+        assert_eq!(
+            &a.data[..4],
+            &[0xD0, 0xCF, 0x11, 0xE0],
+            "the compound file, without the id"
+        );
+    }
+
+    /// A real sample attaches AUTOEXEC.BAT and CONFIG.SYS with no bytes.
+    #[test]
+    fn an_empty_file_with_a_name_is_still_listed() {
+        let data = stream(&[
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_RENDDATA, &[0; 14]),
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_DATA, b""),
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_TITLE, b"CONFIG.SYS\0"),
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_RENDDATA, &[0; 14]),
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_DATA, b"[boot loader]"),
+            attribute(LVL_ATTACHMENT, ATT_ATTACH_TITLE, b"boot.ini\0"),
+        ]);
+        let names: Vec<_> = decode(&data)
+            .unwrap()
+            .attachments
+            .into_iter()
+            .map(|a| (a.filename.unwrap(), a.data.len()))
+            .collect();
+        assert_eq!(
+            names,
+            [("CONFIG.SYS".to_string(), 0), ("boot.ini".to_string(), 13)]
+        );
+    }
+
     #[test]
     fn nesting_is_followed_only_so_deep() {
         let mut data = one_file("deep.txt", b"x");
@@ -621,7 +709,11 @@ mod tests {
                 ),
             ]);
         }
-        assert!(decode(&data).unwrap().attachments.is_empty());
+        // Past the limit the innermost wrapper is not opened; it is kept as
+        // an opaque file rather than lost.
+        let t = decode(&data).unwrap();
+        assert_eq!(t.attachments.len(), 1);
+        assert!(is_tnef(&t.attachments[0].data[16..]) || is_tnef(&t.attachments[0].data));
     }
 
     #[test]
@@ -680,12 +772,74 @@ mod tests {
         }
     }
 
+    /// Manual check against real Outlook-written files:
+    /// `SKIM_TNEF_SAMPLES=<dir> cargo test --lib -- --ignored real_tnef --nocapture`
     #[test]
-    fn an_entry_without_content_is_not_listed() {
-        let data = stream(&[
-            attribute(LVL_ATTACHMENT, ATT_ATTACH_RENDDATA, &[0; 14]),
-            attribute(LVL_ATTACHMENT, ATT_ATTACH_TITLE, b"empty.txt\0"),
-        ]);
+    #[ignore = "needs SKIM_TNEF_SAMPLES pointing at a folder of winmail.dat files"]
+    fn real_tnef_samples() {
+        let Ok(dir) = std::env::var("SKIM_TNEF_SAMPLES") else {
+            return;
+        };
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("tnef" | "dat")))
+            .collect();
+        entries.sort();
+        for path in entries {
+            let data = std::fs::read(&path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            match decode(&data) {
+                None => println!("{name}: NOT TNEF"),
+                Some(t) => {
+                    let files: Vec<String> = t
+                        .attachments
+                        .iter()
+                        .map(|a| {
+                            format!(
+                                "{} ({} B{})",
+                                a.filename.as_deref().unwrap_or("<no name>"),
+                                a.data.len(),
+                                a.mime_type
+                                    .as_deref()
+                                    .map(|m| format!(", {m}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    // Where a reference extraction exists, compare the bytes.
+                    if let Ok(baselines) = std::env::var("SKIM_TNEF_BASELINES") {
+                        for a in &t.attachments {
+                            let Some(file) = &a.filename else { continue };
+                            let reference =
+                                std::path::Path::new(&baselines).join(format!("{file}.baseline"));
+                            if let Ok(expected) = std::fs::read(&reference) {
+                                // The reference keeps an OLE object's 16-byte id.
+                                let same =
+                                    expected == a.data || expected.get(16..) == Some(&a.data[..]);
+                                println!(
+                                    "  {file}: bytes {}",
+                                    if same { "match" } else { "DIFFER" }
+                                );
+                                assert!(same, "{file} differs from the reference");
+                            }
+                        }
+                    }
+                    println!(
+                        "{name}: [{}] text={} html={}",
+                        files.join(" | "),
+                        t.text.as_ref().map_or(0, |s| s.len()),
+                        t.html.as_ref().map_or(0, |s| s.len())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_with_neither_name_nor_content_is_not_listed() {
+        let data = stream(&[attribute(LVL_ATTACHMENT, ATT_ATTACH_RENDDATA, &[0; 14])]);
         assert!(decode(&data).unwrap().attachments.is_empty());
     }
 }

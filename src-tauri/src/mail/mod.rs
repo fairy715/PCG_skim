@@ -38,5 +38,8 @@ pub fn spawn_engine(
 }
 
 #[cfg(test)]
+mod server_tests;
+
+#[cfg(test)]
 #[path = "threading_tests.rs"]
 mod threading_tests;

@@ -84,11 +84,173 @@ struct Engine {
 }
 
 /// Outcome of one download pass.
-struct Pass {
+#[derive(Debug)]
+pub struct Pass {
+    /// The local inbox the mail went to.
+    pub inbox: i64,
     /// Newly stored messages.
-    stored: Vec<i64>,
+    pub stored: Vec<i64>,
     /// The maildrop still holds mail this pass did not get to.
-    more: bool,
+    pub more: bool,
+    /// The first full download had already happened before this pass, so
+    /// what it stored is new mail rather than history.
+    pub initial_done: bool,
+}
+
+/// A pass that failed part-way. What it stored before the failure is kept.
+#[derive(Debug)]
+pub struct PartialPass {
+    pub inbox: i64,
+    pub stored: Vec<i64>,
+    pub error: SkimError,
+}
+
+impl From<SkimError> for PartialPass {
+    fn from(error: SkimError) -> Self {
+        PartialPass {
+            inbox: 0,
+            stored: Vec::new(),
+            error,
+        }
+    }
+}
+
+/// Where the account's mail goes locally, whether its first full download is
+/// done, and the maildrop ids it already has.
+async fn local_state(db: &Db, account_id: &str) -> Result<(i64, bool, HashSet<String>)> {
+    let account_id = account_id.to_string();
+    db.call(move |conn| {
+        ensure_schema(conn)?;
+        local_store::ensure_folders(conn, &account_id)?;
+        let (inbox, done): (i64, bool) = conn.query_row(
+            "SELECT id, backfill_done FROM folders
+             WHERE account_id = ?1 AND role = 'inbox' ORDER BY id LIMIT 1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut stmt = conn.prepare("SELECT uidl FROM pop3_seen WHERE account_id = ?1")?;
+        let seen = stmt
+            .query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok((inbox, done, seen))
+    })
+    .await
+}
+
+/// One download pass: log in, list the maildrop, fetch up to `batch` messages
+/// not seen before into the local inbox, log out. Independent of the app
+/// window, so it can run against a real server in a test. `progress` gets
+/// `(inbox, done, total)` after each message.
+pub async fn download_pass(
+    db: &Db,
+    data_dir: &std::path::Path,
+    account: &Account,
+    password: &str,
+    batch: usize,
+    mut progress: impl FnMut(i64, usize, usize),
+) -> std::result::Result<Pass, PartialPass> {
+    let (inbox, initial_done, seen) = local_state(db, &account.id).await?;
+    let partial = |stored: Vec<i64>, error| PartialPass {
+        inbox,
+        stored,
+        error,
+    };
+    let mut session = pop3_client::login(
+        &account.imap_host,
+        account.imap_port,
+        account.login_user(),
+        password,
+    )
+    .await
+    .map_err(|e| partial(Vec::new(), e))?;
+    let listing = match session.uidl().await {
+        Ok(listing) => listing,
+        Err(e) => {
+            session.quit().await;
+            return Err(partial(Vec::new(), e));
+        }
+    };
+    let (todo, more) = plan_batch(&listing, &seen, batch);
+    let stale = stale_ids(&listing, &seen);
+    let total = todo.len();
+
+    let mut stored = Vec::new();
+    let mut failure = None;
+    for (done, entry) in todo.into_iter().enumerate() {
+        let raw = match session.retr(entry.number).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        };
+        let account_id = account.id.clone();
+        let data_dir = data_dir.to_path_buf();
+        let outcome = db
+            .call(move |conn| {
+                let pk = match local_store::store_raw(
+                    conn,
+                    &data_dir,
+                    &account_id,
+                    inbox,
+                    &raw,
+                    false,
+                ) {
+                    Ok(pk) => pk,
+                    Err(e) => return Ok(Err(e)),
+                };
+                // Recorded only once the message is safely stored: a crash
+                // in between costs one duplicate, never a lost message.
+                conn.execute(
+                    "INSERT OR IGNORE INTO pop3_seen (account_id, uidl) VALUES (?1, ?2)",
+                    rusqlite::params![account_id, entry.uidl],
+                )?;
+                Ok(Ok(pk))
+            })
+            .await;
+        match outcome {
+            Ok(Ok(pk)) => stored.extend(pk),
+            Ok(Err(e)) | Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+        progress(inbox, done + 1, total);
+    }
+    session.quit().await;
+    if let Some(e) = failure {
+        return Err(partial(stored, e));
+    }
+
+    let account_id = account.id.clone();
+    let finished = !more;
+    let cleanup = db
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            for id in &stale {
+                tx.execute(
+                    "DELETE FROM pop3_seen WHERE account_id = ?1 AND uidl = ?2",
+                    rusqlite::params![account_id, id],
+                )?;
+            }
+            if finished {
+                tx.execute(
+                    "UPDATE folders SET backfill_done = 1 WHERE id = ?1",
+                    rusqlite::params![inbox],
+                )?;
+            }
+            tx.commit()
+        })
+        .await;
+    if let Err(e) = cleanup {
+        return Err(partial(stored, e));
+    }
+    Ok(Pass {
+        inbox,
+        stored,
+        more,
+        initial_done,
+    })
 }
 
 impl Engine {
@@ -111,128 +273,42 @@ impl Engine {
             .ok_or_else(|| SkimError::other("auth", "no stored credentials for this account"))
     }
 
-    /// Returns `(inbox folder id, initial download finished, ids already seen)`.
-    async fn local_state(&self) -> Result<(i64, bool, HashSet<String>)> {
-        let account_id = self.account.id.clone();
-        self.db
-            .call(move |conn| {
-                ensure_schema(conn)?;
-                local_store::ensure_folders(conn, &account_id)?;
-                let (inbox, done): (i64, bool) = conn.query_row(
-                    "SELECT id, backfill_done FROM folders
-                     WHERE account_id = ?1 AND role = 'inbox' ORDER BY id LIMIT 1",
-                    rusqlite::params![account_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                let mut stmt = conn.prepare("SELECT uidl FROM pop3_seen WHERE account_id = ?1")?;
-                let seen = stmt
-                    .query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<HashSet<_>>>()?;
-                Ok((inbox, done, seen))
-            })
-            .await
-    }
-
     async fn download(&mut self) -> Result<Pass> {
-        let (inbox, initial_done, seen) = self.local_state().await?;
         let password = self.password()?;
-        let mut session = pop3_client::login(
-            &self.account.imap_host,
-            self.account.imap_port,
-            self.account.login_user(),
+        let app = self.app.clone();
+        let pass = download_pass(
+            &self.db,
+            &self.data_dir,
+            &self.account,
             &password,
+            BATCH,
+            |inbox, done, total| {
+                let _ = app.emit(
+                    "sync:progress",
+                    json!({ "folderId": inbox, "done": done, "total": total }),
+                );
+            },
         )
-        .await?;
-        let listing = session.uidl().await?;
-        let (batch, more) = plan_batch(&listing, &seen, BATCH);
-        let stale = stale_ids(&listing, &seen);
-        let total = batch.len();
-
-        let mut stored = Vec::new();
-        let mut failure = None;
-        for (done, entry) in batch.into_iter().enumerate() {
-            let raw = match session.retr(entry.number).await {
-                Ok(raw) => raw,
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            };
-            let account_id = self.account.id.clone();
-            let data_dir = self.data_dir.clone();
-            let outcome = self
-                .db
-                .call(move |conn| {
-                    let pk = match local_store::store_raw(
-                        conn,
-                        &data_dir,
-                        &account_id,
-                        inbox,
-                        &raw,
-                        false,
-                    ) {
-                        Ok(pk) => pk,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    // Recorded only once the message is safely stored: a crash
-                    // in between costs one duplicate, never a lost message.
-                    conn.execute(
-                        "INSERT OR IGNORE INTO pop3_seen (account_id, uidl) VALUES (?1, ?2)",
-                        rusqlite::params![account_id, entry.uidl],
-                    )?;
-                    Ok(Ok(pk))
-                })
-                .await;
-            match outcome {
-                Ok(Ok(pk)) => stored.extend(pk),
-                Ok(Err(e)) | Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            }
-            let _ = self.app.emit(
-                "sync:progress",
-                json!({ "folderId": inbox, "done": done + 1, "total": total }),
-            );
-        }
-        session.quit().await;
-
-        // What was stored before a failure is real and should show up now.
+        .await;
+        // What was stored is real and should show up now, even when the pass
+        // then failed part-way.
+        let (inbox, stored) = match &pass {
+            Ok(p) => (p.inbox, p.stored.as_slice()),
+            Err(partial) => (partial.inbox, partial.stored.as_slice()),
+        };
         if !stored.is_empty() {
             let _ = self.app.emit("mail:updated", json!({ "folderId": inbox }));
         }
-        if let Some(e) = failure {
-            return Err(e);
-        }
-
-        let account_id = self.account.id.clone();
-        let finished = !more;
-        self.db
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                for id in &stale {
-                    tx.execute(
-                        "DELETE FROM pop3_seen WHERE account_id = ?1 AND uidl = ?2",
-                        rusqlite::params![account_id, id],
-                    )?;
-                }
-                if finished {
-                    tx.execute(
-                        "UPDATE folders SET backfill_done = 1 WHERE id = ?1",
-                        rusqlite::params![inbox],
-                    )?;
-                }
-                tx.commit()
-            })
-            .await?;
-
+        let pass = pass.map_err(|partial| partial.error)?;
         // Mail that was already in the maildrop when the account was added is
         // history, not news: only arrivals after the first full download toast.
-        if initial_done && !stored.is_empty() {
-            let _ = self.app.emit("mail:new", json!({ "count": stored.len() }));
-            crate::notify::notify_new_mail(&self.app, &self.db, &stored).await;
+        if pass.initial_done && !pass.stored.is_empty() {
+            let _ = self
+                .app
+                .emit("mail:new", json!({ "count": pass.stored.len() }));
+            crate::notify::notify_new_mail(&self.app, &self.db, &pass.stored).await;
         }
-        Ok(Pass { stored, more })
+        Ok(pass)
     }
 
     /// One pass. Returns whether another should follow straight away.

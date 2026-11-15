@@ -308,6 +308,7 @@
   "settings.import_pst": "Impor file Outlook (.pst)",
   "settings.import_running": "Mengimpor… {done} / {total}",
   "settings.import_done": "{count} pesan diimpor",
+  "settings.import_done_contacts": "{count} pesan dan {contacts} kontak diimpor",
   "settings.import_stopped": "Impor dihentikan — {count} diimpor. Impor file yang sama lagi untuk melanjutkan.",
   "settings.import_failed": "Impor gagal: {message}",
   "settings.import_stop": "Hentikan",

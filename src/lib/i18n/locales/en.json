@@ -308,6 +308,7 @@
   "settings.import_pst": "Import Outlook file (.pst)",
   "settings.import_running": "Importing… {done} / {total}",
   "settings.import_done": "Imported {count} messages",
+  "settings.import_done_contacts": "Imported {count} messages and {contacts} contacts",
   "settings.import_stopped": "Import stopped — {count} imported. Import the same file again to continue.",
   "settings.import_failed": "Import failed: {message}",
   "settings.import_stop": "Stop",

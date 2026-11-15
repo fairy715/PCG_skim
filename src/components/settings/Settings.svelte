@@ -548,7 +548,11 @@
     if (p.phase === "running") {
       return t("settings.import_running", { done: n(p.done), total: n(p.total) });
     }
-    if (p.phase === "done") return t("settings.import_done", { count: n(p.imported) });
+    if (p.phase === "done") {
+      return p.contacts > 0
+        ? t("settings.import_done_contacts", { count: n(p.imported), contacts: n(p.contacts) })
+        : t("settings.import_done", { count: n(p.imported) });
+    }
     if (p.phase === "cancelled") return t("settings.import_stopped", { count: n(p.imported) });
     return t("settings.import_failed", { message: p.message ?? "" });
   }

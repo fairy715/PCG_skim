@@ -9,6 +9,7 @@ pub mod oauth;
 pub mod parse;
 pub mod pop3;
 pub mod pop3_client;
+pub mod pst_contacts;
 pub mod pst_import;
 pub mod sanitize;
 pub mod smtp;

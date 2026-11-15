@@ -43,7 +43,42 @@ export interface ImportProgress {
   message: string | null;
 }
 
+/** An address-book entry (fork addition). `id` 0 means not stored yet. */
+export interface Contact {
+  id: number;
+  name: string;
+  email: string;
+  company: string | null;
+  phone: string | null;
+  note: string | null;
+}
+
+/** A named set of contacts the recipient field expands into its members. */
+export interface ContactGroup {
+  id: number;
+  name: string;
+  memberIds: number[];
+}
+
+export interface ContactImportReport {
+  added: number;
+  updated: number;
+  skipped: number;
+}
+
 export const api = {
+  // address book
+  listContacts: () => invoke<Contact[]>("list_contacts"),
+  saveContact: (contact: Contact) => invoke<Contact>("save_contact", { contact }),
+  deleteContacts: (ids: number[]) => invoke<void>("delete_contacts", { ids }),
+  listContactGroups: () => invoke<ContactGroup[]>("list_contact_groups"),
+  saveContactGroup: (id: number, name: string, memberIds: number[]) =>
+    invoke<ContactGroup>("save_contact_group", { id, name, memberIds }),
+  deleteContactGroup: (id: number) => invoke<void>("delete_contact_group", { id }),
+  /** Picks a vCard/CSV file; null if the user cancelled. */
+  importContacts: () => invoke<ContactImportReport | null>("import_contacts"),
+  /** Asks where to save; returns the path, or null if cancelled. */
+  exportContacts: () => invoke<string | null>("export_contacts"),
   // PST import: picks a file, returns the archive account (null if cancelled).
   importPst: () => invoke<Account | null>("import_pst"),
   cancelPstImport: (accountId: string) => invoke<void>("cancel_pst_import", { accountId }),

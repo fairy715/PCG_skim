@@ -2,6 +2,7 @@ pub mod ai;
 pub mod badge;
 pub mod brand;
 pub mod commands;
+pub mod contacts;
 pub mod db;
 pub mod error;
 pub mod mail;
@@ -218,6 +219,8 @@ pub fn run() {
             notify::register_aumid();
             notify::register_url_scheme();
             let db = db::Db::open(&data_dir.join("skim.db"))?;
+            // Fork addition: the address book's tables, before anything asks.
+            db.with(|conn| contacts::ensure_schema(conn))?;
             app.manage(AppState::new(db.clone(), data_dir.clone()));
 
             let locale = db
@@ -341,6 +344,14 @@ pub fn run() {
             commands::accounts::update_account_identity,
             commands::accounts::remove_account,
             commands::accounts::inbox_unread_counts,
+            commands::contacts::list_contacts,
+            commands::contacts::save_contact,
+            commands::contacts::delete_contacts,
+            commands::contacts::list_contact_groups,
+            commands::contacts::save_contact_group,
+            commands::contacts::delete_contact_group,
+            commands::contacts::import_contacts,
+            commands::contacts::export_contacts,
             commands::pst::import_pst,
             commands::pst::cancel_pst_import,
             commands::pst::pst_import_status,

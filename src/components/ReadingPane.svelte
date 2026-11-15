@@ -9,6 +9,7 @@
   import AiAsk from "./AiAsk.svelte";
   import AttachmentChips from "./AttachmentChips.svelte";
   import CopyAffordance from "./CopyAffordance.svelte";
+  import AddContactAffordance from "./AddContactAffordance.svelte";
   import HtmlViewer from "./HtmlViewer.svelte";
   import InviteCard from "./InviteCard.svelte";
 
@@ -647,6 +648,7 @@
             <span class="addr">&lt;{message.from.addr}&gt;</span>
           </span>
           <CopyAffordance value={message.from.addr} label={t("reading.copy_address")} />
+          <AddContactAffordance name={message.from.name} email={message.from.addr} />
         </div>
         {@render recipientsLine(message)}
       </div>

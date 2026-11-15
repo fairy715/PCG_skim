@@ -74,7 +74,8 @@ pub async fn suggest_addresses(
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(rows)
+            // Fork addition: the address book answers first.
+            crate::commands::contacts::with_address_book(conn, &like, rows)
         })
         .await
 }

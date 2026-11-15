@@ -8,6 +8,7 @@
   import { ui } from "../lib/stores/ui.svelte";
   import { updater } from "../lib/stores/update.svelte";
   import Settings from "./settings/Settings.svelte";
+  import Contacts from "./Contacts.svelte";
 
   async function compose() {
     const draft = await api.createDraft(await mail.composeAccountId());
@@ -172,6 +173,13 @@
         <span class="name">{t("update.error")}</span>
       </button>
     {/if}
+    <button class="item" onclick={() => ui.openContacts()} title={collapsed ? t("nav.contacts") : undefined}>
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="8" cy="5.5" r="2.7" />
+        <path d="M2.8 13.6c.6-2.7 2.7-4.2 5.2-4.2s4.6 1.5 5.2 4.2" />
+      </svg>
+      <span class="name">{t("nav.contacts")}</span>
+    </button>
     <button class="item" onclick={() => ui.openSettings()} title={collapsed ? t("nav.settings") : undefined}>
       <span class="avatar">{((mail.account ?? mail.accounts[0])?.email ?? "?").charAt(0).toUpperCase()}</span>
       <span class="name">{t("nav.settings")}</span>
@@ -196,6 +204,9 @@
 
 {#if ui.settingsOpen}
   <Settings onclose={() => ui.closeSettings()} />
+{/if}
+{#if ui.contactsOpen}
+  <Contacts onclose={() => ui.closeContacts()} />
 {/if}
 
 <style>

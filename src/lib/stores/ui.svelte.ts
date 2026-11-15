@@ -29,6 +29,8 @@ const state = $state({
   temperature: "warm" as Temperature,
   lightness: "light" as Lightness,
   settingsOpen: false,
+  /** Address book panel (fork addition). */
+  contactsOpen: false,
   /** AI Recap panel occupies the reading pane while open. */
   recapOpen: false,
   /** Keyboard-shortcuts cheat sheet overlay. */
@@ -120,6 +122,15 @@ export const ui = {
   },
   closeSettings() {
     state.settingsOpen = false;
+  },
+  get contactsOpen() {
+    return state.contactsOpen;
+  },
+  openContacts() {
+    state.contactsOpen = true;
+  },
+  closeContacts() {
+    state.contactsOpen = false;
   },
   get recapOpen() {
     return state.recapOpen;

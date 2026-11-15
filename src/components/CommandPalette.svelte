@@ -81,6 +81,11 @@
         run: () => ui.toggleSidebar(),
       },
       {
+        id: "contacts",
+        label: t("nav.contacts"),
+        run: () => ui.openContacts(),
+      },
+      {
         id: "shortcuts",
         label: t("palette.shortcuts"),
         hint: "?",

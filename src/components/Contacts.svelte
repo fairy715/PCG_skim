@@ -67,6 +67,7 @@
     else if (code === "group_name") error = t("contacts.err_group_name");
     else if (code === "group_exists") error = t("contacts.err_group_exists");
     else if (code === "contacts_import") error = t("contacts.err_import_empty");
+    else if (code === "contacts_too_large") error = t("contacts.err_import_too_large");
     else error = errorMessage(e);
   }
 

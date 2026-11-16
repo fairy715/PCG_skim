@@ -121,8 +121,11 @@ pub enum Saved {
 
 /// Store a contact. With an id it is edited in place; without one it is added,
 /// or merged into the contact that already has this address — an address book
-/// with the same person in it twice helps nobody. On a merge, fields the
-/// incoming contact leaves empty keep their stored value.
+/// with the same person in it twice helps nobody. On a merge, what the book
+/// already holds stays: the incoming contact only fills in what is missing.
+/// Merges come from imported files and from a sender's own display name, and
+/// neither may rename someone the user already has — a forged From name or a
+/// stranger's PST would otherwise relabel a colleague's address.
 pub fn save(conn: &Connection, contact: &Contact) -> rusqlite::Result<(Contact, Saved)> {
     let email = contact.email.trim().to_string();
     let name = contact.name.trim().to_string();
@@ -149,10 +152,10 @@ pub fn save(conn: &Connection, contact: &Contact) -> rusqlite::Result<(Contact, 
         Some(id) => {
             conn.execute(
                 "UPDATE pcg_contacts SET
-                   name    = CASE WHEN ?2 = '' THEN name ELSE ?2 END,
-                   company = COALESCE(?3, company),
-                   phone   = COALESCE(?4, phone),
-                   note    = COALESCE(?5, note)
+                   name    = CASE WHEN name = '' THEN ?2 ELSE name END,
+                   company = COALESCE(company, ?3),
+                   phone   = COALESCE(phone, ?4),
+                   note    = COALESCE(note, ?5)
                  WHERE id = ?1",
                 params![id, name, company, phone, note],
             )?;
@@ -499,22 +502,36 @@ fn unescape_vcard(value: &str) -> String {
 fn vcard_lines(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut soft_break = false;
+    // Whether the current logical line has reached its `:` yet, and whether
+    // its head names quoted-printable. Worked out once per logical line, so
+    // a long run of continuations costs linear time, not quadratic.
+    let mut head_seen = false;
+    let mut qp = false;
     for raw in text.lines() {
         let folded = raw.starts_with(' ') || raw.starts_with('\t');
-        if let (true, Some(last)) = (folded || soft_break, lines.last_mut()) {
-            last.push_str(if soft_break { raw } else { &raw[1..] });
+        let piece = if let (true, Some(last)) = (folded || soft_break, lines.last_mut()) {
+            let piece = if soft_break { raw } else { &raw[1..] };
+            last.push_str(piece);
+            piece
         } else {
             lines.push(raw.to_string());
-        }
+            head_seen = false;
+            qp = false;
+            raw
+        };
         soft_break = false;
-        if let Some(last) = lines.last_mut() {
-            let qp = last
+        let Some(last) = lines.last_mut() else {
+            continue;
+        };
+        if !head_seen && piece.contains(':') {
+            head_seen = true;
+            qp = last
                 .split_once(':')
                 .is_some_and(|(head, _)| head.to_ascii_uppercase().contains("QUOTED-PRINTABLE"));
-            if qp && last.ends_with('=') {
-                last.pop();
-                soft_break = true;
-            }
+        }
+        if qp && last.ends_with('=') {
+            last.pop();
+            soft_break = true;
         }
     }
     lines
@@ -966,6 +983,61 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_merge_never_renames_or_relabels_a_known_contact() {
+        let db = db();
+        db.with(|conn| {
+            save(
+                conn,
+                &Contact {
+                    phone: Some("123".into()),
+                    ..contact("Ann Lee", "ann@example.com")
+                },
+            )?;
+            // A forged display name, or a stranger's file, for the same address.
+            let (merged, _) = save(
+                conn,
+                &Contact {
+                    company: Some("Acme".into()),
+                    phone: Some("999".into()),
+                    ..contact("CEO", "ann@example.com")
+                },
+            )?;
+            assert_eq!(merged.name, "Ann Lee");
+            assert_eq!(merged.phone.as_deref(), Some("123"));
+            // What was missing is filled in.
+            assert_eq!(merged.company.as_deref(), Some("Acme"));
+            // Editing the contact itself still changes everything.
+            let edited = save(
+                conn,
+                &Contact {
+                    name: "Ann".into(),
+                    ..merged
+                },
+            )?
+            .0;
+            assert_eq!(edited.name, "Ann");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_long_run_of_continuation_lines_unfolds_in_linear_time() {
+        // Quadratic unfolding took minutes on a few megabytes of this.
+        let mut text = String::from("BEGIN:VCARD\nX\n");
+        text.push_str(&" a\n".repeat(200_000));
+        let lines = vcard_lines(&text);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].len(), 1 + 200_000);
+    }
+
+    #[test]
+    fn quoted_printable_is_found_when_the_head_spans_a_fold() {
+        let lines = vcard_lines("NOTE;ENCODING=QUOTED-\n PRINTABLE:a=\nb\n");
+        assert_eq!(lines, ["NOTE;ENCODING=QUOTED-PRINTABLE:ab"]);
     }
 
     #[test]

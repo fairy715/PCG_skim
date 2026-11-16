@@ -118,6 +118,7 @@
   "contacts.err_group_name": "The group needs a name.",
   "contacts.err_group_exists": "A group with this name already exists.",
   "contacts.err_import_empty": "No contacts were found in this file.",
+  "contacts.err_import_too_large": "This file is too large to be an address book.",
   "nav.collapse": "Collapse sidebar",
   "nav.expand": "Expand sidebar",
   "list.unread_one": "{n} unread",

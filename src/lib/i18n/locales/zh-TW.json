@@ -118,6 +118,7 @@
   "contacts.err_group_name": "請輸入群組名稱。",
   "contacts.err_group_exists": "已有同名的群組。",
   "contacts.err_import_empty": "這個檔案裡找不到聯絡人。",
+  "contacts.err_import_too_large": "這個檔案太大，不像是通訊錄。",
   "nav.collapse": "收合側邊欄",
   "nav.expand": "展開側邊欄",
   "list.unread_one": "{n} 封未讀",

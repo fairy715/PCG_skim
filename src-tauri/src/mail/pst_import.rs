@@ -28,7 +28,7 @@ use crate::db::models::{Address, NewMessage};
 use crate::db::Db;
 use crate::error::{Result, SkimError};
 use crate::mail::parse::{self, ParsedAttachment, ParsedBody};
-use crate::mail::{local_store, tnef};
+use crate::mail::{local_store, pst_contacts, tnef};
 use outlook_pst::ltp::prop_context::PropertyValue;
 use outlook_pst::messaging::attachment::{
     AnsiAttachment, Attachment, AttachmentData, UnicodeAttachment,
@@ -118,6 +118,9 @@ pub struct Progress {
     pub imported: u64,
     /// Items that could not be read or stored.
     pub failed: u64,
+    /// Contacts added to or updated in the address book, from the file's
+    /// contacts folders and distribution lists.
+    pub contacts: u64,
     /// Set when `phase` is `Error`.
     pub message: Option<String>,
 }
@@ -202,6 +205,13 @@ impl Source {
 /// A message and the attachments of it that could be read.
 type OpenedMessage = (Rc<dyn Message>, Vec<Rc<dyn Attachment>>);
 
+/// The folders of a file worth importing.
+#[derive(Default)]
+struct Folders {
+    mail: Vec<PstFolder>,
+    contacts: Vec<Rc<dyn Folder>>,
+}
+
 /// A mail folder found in the file.
 struct PstFolder {
     /// Names from the top of the mailbox down to this folder.
@@ -260,26 +270,21 @@ fn is_mail_item(class: &str) -> bool {
         || c == "ipm"
 }
 
-/// Walk the mailbox tree, collecting mail folders in display order.
-fn collect_folders(source: &Source) -> Result<Vec<PstFolder>> {
+/// Walk the mailbox tree, collecting mail folders in display order and the
+/// contacts folders.
+fn collect_folders(source: &Source) -> Result<Folders> {
     let root_id = source
         .store()
         .properties()
         .ipm_sub_tree_entry_id()
         .map_err(pst_err)?;
     let root = source.store().open_folder(&root_id).map_err(pst_err)?;
-    let mut out = Vec::new();
+    let mut out = Folders::default();
     walk(source, &root, &[], &mut out, 0);
     Ok(out)
 }
 
-fn walk(
-    source: &Source,
-    parent: &Rc<dyn Folder>,
-    path: &[String],
-    out: &mut Vec<PstFolder>,
-    depth: u8,
-) {
+fn walk(source: &Source, parent: &Rc<dyn Folder>, path: &[String], out: &mut Folders, depth: u8) {
     // A folder tree this deep is a corrupt file looping on itself.
     if depth > 32 {
         return;
@@ -304,10 +309,12 @@ fn walk(
         let mut child_path = path.to_vec();
         child_path.push(name);
         if is_mail_folder(class.as_deref()) {
-            out.push(PstFolder {
+            out.mail.push(PstFolder {
                 path: child_path.clone(),
                 folder: folder.clone(),
             });
+        } else if pst_contacts::is_contacts_folder(class.as_deref()) {
+            out.contacts.push(folder.clone());
         }
         // Mail folders can sit under a non-mail parent, so always descend.
         walk(source, &folder, &child_path, out, depth + 1);
@@ -547,6 +554,7 @@ fn convert(
 /// purpose, like `pop3_seen`: those numbers belong to upstream.
 pub fn ensure_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     local_store::ensure_schema(conn)?;
+    crate::contacts::ensure_schema(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pst_imported (
            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -605,7 +613,10 @@ fn run_with(
     mut report: impl FnMut(&Progress),
 ) -> Result<Progress> {
     let source = Source::open(path)?;
-    let folders = collect_folders(&source)?;
+    let Folders {
+        mail: folders,
+        contacts: contact_folders,
+    } = collect_folders(&source)?;
 
     let mut progress = Progress {
         account_id: account_id.to_string(),
@@ -614,6 +625,7 @@ fn run_with(
         done: 0,
         imported: 0,
         failed: 0,
+        contacts: 0,
         message: None,
     };
     progress.total = folders
@@ -639,6 +651,24 @@ fn run_with(
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(seen)
     })?;
+
+    // The address book first: it is quick, and merging by address makes it
+    // safe to repeat when an interrupted import resumes.
+    if !contact_folders.is_empty() {
+        let found = pst_contacts::read(source.store(), &contact_folders);
+        // People, not entries: someone who is a contact and also on a list
+        // arrives twice and is one contact in the book.
+        let people: HashSet<String> = found
+            .entries
+            .iter()
+            .map(|e| e.contact.email.to_lowercase())
+            .collect();
+        match db.with(|conn| crate::contacts::import(conn, &found.entries, found.skipped)) {
+            Ok(_) => progress.contacts = people.len() as u64,
+            // Contacts are a side dish; the mail still imports.
+            Err(e) => tracing::warn!(error = %e, "cannot import PST contacts"),
+        }
+    }
     report(&progress);
 
     let mut io_failures = 0u32;
@@ -828,6 +858,7 @@ pub fn launch(app: &AppHandle, db: &Db, data_dir: &Path, account_id: &str, path:
                     done: 0,
                     imported: 0,
                     failed: 0,
+                    contacts: 0,
                     message: Some(e.to_string()),
                 }
             }
@@ -989,6 +1020,103 @@ mod tests {
         let sql = sql.to_string();
         db.with(move |conn| conn.query_row(&sql, [], |r| r.get(0)))
             .unwrap()
+    }
+
+    /// A PST written by Outlook (see tests/fixtures/README.md): one contact
+    /// and a distribution list of three in its Contacts folder, no mail.
+    fn outlook_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/outlook-dist-list.pst")
+    }
+
+    fn book(db: &Db) -> (Vec<crate::contacts::Contact>, Vec<crate::contacts::Group>) {
+        db.with(|conn| {
+            Ok((
+                crate::contacts::list(conn)?,
+                crate::contacts::list_groups(conn)?,
+            ))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn contacts_and_a_distribution_list_written_by_outlook_are_imported() {
+        let db = archive_db();
+        let dir = temp_dir("outlook-contacts");
+        let p = run(
+            &db,
+            &dir,
+            "arc",
+            &outlook_fixture(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(p.phase, Phase::Done);
+        assert_eq!(p.contacts, 3);
+        assert_eq!(
+            (p.total, p.imported),
+            (0, 0),
+            "no mail, and the appointment is not mail"
+        );
+
+        let (contacts, groups) = book(&db);
+        let mut people: Vec<(&str, &str)> = contacts
+            .iter()
+            .map(|c| (c.email.as_str(), c.name.as_str()))
+            .collect();
+        people.sort();
+        assert_eq!(
+            people,
+            [
+                ("contact1@rjohnson.id.au", "contact name 1"),
+                ("dist1@rjohnson.id.au", "dist name 1"),
+                ("dist2@rjohnson.id.au", "dist name 2"),
+            ]
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "test dist list");
+        assert_eq!(
+            groups[0].member_ids.len(),
+            3,
+            "the contact and both one-off members"
+        );
+    }
+
+    #[test]
+    fn importing_the_contacts_again_adds_no_one() {
+        let db = archive_db();
+        let dir = temp_dir("outlook-contacts-again");
+        run(
+            &db,
+            &dir,
+            "arc",
+            &outlook_fixture(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let again = run(
+            &db,
+            &dir,
+            "arc",
+            &outlook_fixture(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(again.contacts, 3, "merged into the same three");
+        let (contacts, groups) = book(&db);
+        assert_eq!(contacts.len(), 3);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_ids.len(), 3);
+    }
+
+    #[test]
+    fn a_file_without_contacts_leaves_the_book_alone() {
+        let db = archive_db();
+        let p = import(&db, &temp_dir("no-contacts"));
+        assert_eq!(p.contacts, 0);
+        assert!(book(&db).0.is_empty());
     }
 
     #[test]

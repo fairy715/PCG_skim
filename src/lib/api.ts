@@ -40,6 +40,8 @@ export interface ImportProgress {
   done: number;
   imported: number;
   failed: number;
+  /** People added to or updated in the address book from the file. */
+  contacts: number;
   message: string | null;
 }
 

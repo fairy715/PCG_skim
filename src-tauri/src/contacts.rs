@@ -420,7 +420,7 @@ fn is_cjk(text: &str) -> bool {
 }
 
 /// Put a given and a family name in the order their language writes them.
-fn full_name(given: &str, family: &str) -> String {
+pub(crate) fn full_name(given: &str, family: &str) -> String {
     let (given, family) = (given.trim(), family.trim());
     if given.is_empty() || family.is_empty() {
         return format!("{given}{family}");

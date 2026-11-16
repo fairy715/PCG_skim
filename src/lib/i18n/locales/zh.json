@@ -282,6 +282,7 @@
   "settings.import_pst": "导入 Outlook 文件（.pst）",
   "settings.import_running": "导入中… {done} / {total}",
   "settings.import_done": "已导入 {count} 封邮件",
+  "settings.import_done_contacts": "已导入 {count} 封邮件、{contacts} 位联系人",
   "settings.import_stopped": "导入已停止，已导入 {count} 封。再次导入同一个文件即可继续。",
   "settings.import_failed": "导入失败：{message}",
   "settings.import_stop": "停止",

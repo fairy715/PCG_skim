@@ -30,6 +30,9 @@ jobs:
       release: ${{ steps.decide.outputs.release }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, to check that a hand-pushed tag sits on main.
+          fetch-depth: 0
 
       - name: Decide
         id: decide
@@ -48,6 +51,13 @@ jobs:
             # installers would carry a different number than the release.
             if [[ "$REF_NAME" != "$tag" ]]; then
               echo "::error::Tag ${REF_NAME} does not match version ${version} in tauri.conf.json"
+              exit 1
+            fi
+            # A tag on a branch that never went through review must not reach
+            # every installed copy through the updater.
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "::error::Tag ${REF_NAME} points at a commit that is not on main"
               exit 1
             fi
             echo "release=true" >> "$GITHUB_OUTPUT"

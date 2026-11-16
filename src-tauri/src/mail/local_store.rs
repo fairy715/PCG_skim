@@ -120,8 +120,9 @@ fn now_unix() -> i64 {
 /// Write one raw message into a local folder — header row, threading, body,
 /// attachments and search index — and return its `messages.id`.
 ///
-/// Attachment files are written before the database rows that point at them;
-/// a crash in between leaves an orphan directory, never a row without a file.
+/// All or nothing: when an attachment cannot be written (a full disk, or an
+/// antivirus refusing the file) the message row goes again, so a retry does
+/// not leave a bodiless duplicate behind.
 pub fn store_raw(
     conn: &mut Connection,
     data_dir: &Path,
@@ -147,19 +148,49 @@ pub fn store_message(
     mut msg: crate::db::models::NewMessage,
     parsed: parse::ParsedBody,
 ) -> Result<Option<i64>> {
-    msg.uid = next_uid(conn, msg.folder_id)?;
+    let folder_id = msg.folder_id;
+    msg.uid = next_uid(conn, folder_id)?;
     if msg.date <= 0 {
         // No usable date: arrival time is the best remaining answer.
         msg.date = now_unix();
     }
-    let Some((message_pk, _thread)) = queries::insert_message(conn, &msg)? else {
+    let Some((message_pk, thread)) = queries::insert_message(conn, &msg)? else {
         return Ok(None);
     };
-
     let dir = data_dir.join("attachments").join(message_pk.to_string());
-    let _ = std::fs::remove_dir_all(&dir);
+    match write_body(conn, &dir, message_pk, &parsed) {
+        Ok(()) => Ok(Some(message_pk)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            let undo = (|| -> rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "DELETE FROM messages_fts WHERE rowid = ?1",
+                    params![message_pk],
+                )?;
+                tx.execute("DELETE FROM messages WHERE id = ?1", params![message_pk])?;
+                threading::recompute_thread(&tx, thread)?;
+                queries::recompute_folder_unread(&tx, folder_id)?;
+                tx.commit()
+            })();
+            if let Err(undo) = undo {
+                tracing::warn!(message_pk, error = %undo, "cannot remove a half-stored message");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The body and attachment half of [`store_message`].
+fn write_body(
+    conn: &mut Connection,
+    dir: &Path,
+    message_pk: i64,
+    parsed: &parse::ParsedBody,
+) -> Result<()> {
+    let _ = std::fs::remove_dir_all(dir);
     if !parsed.attachments.is_empty() {
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(dir)?;
     }
     let mut stored = Vec::with_capacity(parsed.attachments.len());
     for (i, a) in parsed.attachments.iter().enumerate() {
@@ -183,7 +214,7 @@ pub fn store_message(
         &parsed.snippet,
         &stored,
     )?;
-    Ok(Some(message_pk))
+    Ok(())
 }
 
 /// Longest attachment file name kept on disk. Windows caps a whole path at
@@ -372,6 +403,38 @@ Date: Tue, 03 Mar 2026 10:00:00 +0000\r\n\r\nFirst line of the body.\r\n";
         })
         .unwrap();
         db
+    }
+
+    #[test]
+    fn a_message_whose_attachment_cannot_be_written_leaves_nothing_behind() {
+        let db = db_with_account("pop3");
+        let inbox = folder(&db, "inbox");
+        // `attachments` is a file, so its directory cannot be created.
+        let dir = std::env::temp_dir().join(format!("skim-ls-undo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("attachments"), b"in the way").unwrap();
+        let raw = b"From: a@example.com\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nHi\r\n\
+--b\r\nContent-Type: text/csv; name=\"a.csv\"\r\n\
+Content-Disposition: attachment; filename=\"a.csv\"\r\n\r\na,b\r\n--b--\r\n";
+        let failed = db
+            .with(|conn| Ok(store_raw(conn, &dir, "acc", inbox, raw, false).is_err()))
+            .unwrap();
+        assert!(failed);
+        let rows: i64 = db
+            .with(|conn| conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(unread(&db, inbox), 0);
+        // And once the way is clear, the same message stores once.
+        std::fs::remove_file(dir.join("attachments")).unwrap();
+        let stored = db
+            .with(|conn| Ok(store_raw(conn, &dir, "acc", inbox, raw, false).unwrap()))
+            .unwrap();
+        assert!(stored.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn folder(db: &Db, role: &'static str) -> i64 {

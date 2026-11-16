@@ -262,24 +262,32 @@ fn extract_body(parsed: &mail_parser::Message<'_>) -> ParsedBody {
 }
 
 /// Replace Outlook's `winmail.dat` wrapper with the files inside it (fork
-/// addition, see [`crate::mail::tnef`]). The wrapper is recognised by its
-/// content, not its name — it travels under several names and MIME types.
+/// addition, see [`crate::mail::tnef`]).
+///
+/// Only a part that *says* it is a wrapper is opened: typed
+/// `application/ms-tnef` (or `vnd.ms-tnef`), or named `winmail.dat` /
+/// `win.dat`, which is what Outlook and the mail gateways in front of it
+/// unpack too. Opening any attachment whose bytes happen to be TNEF would let
+/// a sender wrap `invoice.exe` inside a part labelled `invoice.pdf`: the
+/// gateway's extension blocking sees a PDF, and we would hand out the
+/// executable.
 ///
 /// It is dropped once it has given something up, or when the message has a
 /// body anyway: what is left in it then is rich-text formatting nobody can
 /// open. A wrapper that yields nothing on a message with no body is kept, so
 /// that the only trace of the content is never thrown away.
 fn unwrap_tnef(mut body: ParsedBody) -> ParsedBody {
-    if !body
-        .attachments
-        .iter()
-        .any(|a| crate::mail::tnef::is_tnef(&a.data))
-    {
+    if !body.attachments.iter().any(is_tnef_wrapper) {
         return body;
     }
     let mut attachments = Vec::with_capacity(body.attachments.len());
     for wrapper in std::mem::take(&mut body.attachments) {
-        let Some(tnef) = crate::mail::tnef::decode(&wrapper.data) else {
+        let decoded = if is_tnef_wrapper(&wrapper) {
+            crate::mail::tnef::decode(&wrapper.data)
+        } else {
+            None
+        };
+        let Some(tnef) = decoded else {
             attachments.push(wrapper);
             continue;
         };
@@ -307,6 +315,20 @@ fn unwrap_tnef(mut body: ParsedBody) -> ParsedBody {
     }
     body.attachments = attachments;
     body
+}
+
+/// Whether a part is labelled as Outlook's TNEF wrapper and holds a TNEF
+/// stream. See [`unwrap_tnef`] for why the label matters.
+fn is_tnef_wrapper(part: &ParsedAttachment) -> bool {
+    let typed = part.mime_type.as_deref().is_some_and(|t| {
+        t.eq_ignore_ascii_case("application/ms-tnef")
+            || t.eq_ignore_ascii_case("application/vnd.ms-tnef")
+    });
+    let named = part.filename.as_deref().is_some_and(|n| {
+        let n = n.trim();
+        n.eq_ignore_ascii_case("winmail.dat") || n.eq_ignore_ascii_case("win.dat")
+    });
+    (typed || named) && crate::mail::tnef::is_tnef(&part.data)
 }
 
 /// Cheap HTML → text for FTS/snippets when a message has no text part.
@@ -1026,6 +1048,23 @@ mod tnef_tests {
     /// A multipart message as Outlook sends it: a text part (optional) and the
     /// wrapper as an `application/ms-tnef` attachment.
     fn message(text: Option<&str>, wrapper: &[u8], extra_part: &str) -> Vec<u8> {
+        labelled(
+            text,
+            wrapper,
+            extra_part,
+            "application/ms-tnef",
+            "winmail.dat",
+        )
+    }
+
+    /// The same, with the wrapper part's type and name chosen by the caller.
+    fn labelled(
+        text: Option<&str>,
+        wrapper: &[u8],
+        extra_part: &str,
+        mime: &str,
+        name: &str,
+    ) -> Vec<u8> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(wrapper);
         let text_part = text
             .map(|t| format!("--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{t}\r\n"))
@@ -1034,9 +1073,9 @@ mod tnef_tests {
             "From: a@example.com\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
              Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
              {text_part}\
-             --b\r\nContent-Type: application/ms-tnef; name=\"winmail.dat\"\r\n\
+             --b\r\nContent-Type: {mime}; name=\"{name}\"\r\n\
              Content-Transfer-Encoding: base64\r\n\
-             Content-Disposition: attachment; filename=\"winmail.dat\"\r\n\r\n\
+             Content-Disposition: attachment; filename=\"{name}\"\r\n\r\n\
              {b64}\r\n{extra_part}--b--\r\n"
         )
         .into_bytes()
@@ -1090,6 +1129,36 @@ mod tnef_tests {
         assert_eq!(body.text.as_deref(), Some("Body from the wrapper"));
         assert_eq!(body.snippet, "Body from the wrapper");
         assert!(body.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_wrapper_disguised_as_another_file_is_not_opened() {
+        // A TNEF stream holding an executable, labelled as a PDF so that a
+        // gateway's extension blocking lets it through.
+        let wrapper = one_file("invoice.pdf.exe", b"MZ");
+        let raw = labelled(Some("Hi"), &wrapper, "", "application/pdf", "invoice.pdf");
+        let body = parse_body(&raw);
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].filename.as_deref(), Some("invoice.pdf"));
+        assert_eq!(body.attachments[0].data, wrapper);
+    }
+
+    #[test]
+    fn a_wrapper_is_recognised_by_its_type_or_its_name() {
+        let wrapper = one_file("a.txt", b"a");
+        for (mime, name) in [
+            ("application/vnd.ms-tnef", "ATT00001.dat"),
+            ("application/octet-stream", "WINMAIL.DAT"),
+            ("application/octet-stream", "win.dat"),
+        ] {
+            let body = parse_body(&labelled(Some("Hi"), &wrapper, "", mime, name));
+            let names: Vec<_> = body
+                .attachments
+                .iter()
+                .map(|a| a.filename.as_deref())
+                .collect();
+            assert_eq!(names, [Some("a.txt")], "{mime} {name}");
+        }
     }
 
     #[test]

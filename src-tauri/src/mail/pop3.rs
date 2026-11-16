@@ -43,8 +43,48 @@ pub fn ensure_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
            uidl       TEXT NOT NULL,
            PRIMARY KEY (account_id, uidl)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS pop3_failed (
+           account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+           uidl       TEXT NOT NULL,
+           tries      INTEGER NOT NULL,
+           PRIMARY KEY (account_id, uidl)
          ) WITHOUT ROWID;",
     )
+}
+
+/// Passes a message may fail in before it is given up on. One message that
+/// cannot be stored (an antivirus refusing its attachment) or downloaded (too
+/// large) must not hold back the rest of the mailbox, nor be fetched again
+/// every few minutes for ever.
+const MAX_TRIES: i64 = 3;
+
+/// Count one more failure for `uidl`. True when that was its last chance:
+/// it is then marked as seen, so later passes leave it on the server.
+fn note_failure(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    uidl: &str,
+) -> rusqlite::Result<bool> {
+    let tries: i64 = conn.query_row(
+        "INSERT INTO pop3_failed (account_id, uidl, tries) VALUES (?1, ?2, 1)
+         ON CONFLICT(account_id, uidl) DO UPDATE SET tries = tries + 1
+         RETURNING tries",
+        rusqlite::params![account_id, uidl],
+        |r| r.get(0),
+    )?;
+    if tries < MAX_TRIES {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO pop3_seen (account_id, uidl) VALUES (?1, ?2)",
+        rusqlite::params![account_id, uidl],
+    )?;
+    conn.execute(
+        "DELETE FROM pop3_failed WHERE account_id = ?1 AND uidl = ?2",
+        rusqlite::params![account_id, uidl],
+    )?;
+    Ok(true)
 }
 
 /// Which maildrop entries to download now, newest first, and whether more are
@@ -115,6 +155,19 @@ impl From<SkimError> for PartialPass {
     }
 }
 
+/// Count a failure for one maildrop entry; see [`note_failure`].
+async fn give_up_later(db: &Db, account_id: &str, uidl: &str) {
+    let (account_id, uidl) = (account_id.to_string(), uidl.to_string());
+    let outcome = db
+        .call(move |conn| note_failure(conn, &account_id, &uidl))
+        .await;
+    match outcome {
+        Ok(true) => tracing::warn!("giving up on a POP3 message after {MAX_TRIES} tries"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "cannot record a POP3 failure"),
+    }
+}
+
 /// Where the account's mail goes locally, whether its first full download is
 /// done, and the maildrop ids it already has.
 async fn local_state(db: &Db, account_id: &str) -> Result<(i64, bool, HashSet<String>)> {
@@ -180,12 +233,19 @@ pub async fn download_pass(
         let raw = match session.retr(entry.number).await {
             Ok(raw) => raw,
             Err(e) => {
+                // A refusal or an oversized message is this message's
+                // problem; the connection is out of step after either, so
+                // the pass ends here. A network failure is nobody's fault.
+                if e.code() != "network" {
+                    give_up_later(db, &account.id, &entry.uidl).await;
+                }
                 failure = Some(e);
                 break;
             }
         };
         let account_id = account.id.clone();
         let data_dir = data_dir.to_path_buf();
+        let uidl = entry.uidl.clone();
         let outcome = db
             .call(move |conn| {
                 let pk = match local_store::store_raw(
@@ -203,14 +263,24 @@ pub async fn download_pass(
                 // in between costs one duplicate, never a lost message.
                 conn.execute(
                     "INSERT OR IGNORE INTO pop3_seen (account_id, uidl) VALUES (?1, ?2)",
-                    rusqlite::params![account_id, entry.uidl],
+                    rusqlite::params![account_id, uidl],
+                )?;
+                conn.execute(
+                    "DELETE FROM pop3_failed WHERE account_id = ?1 AND uidl = ?2",
+                    rusqlite::params![account_id, uidl],
                 )?;
                 Ok(Ok(pk))
             })
             .await;
         match outcome {
             Ok(Ok(pk)) => stored.extend(pk),
-            Ok(Err(e)) | Err(e) => {
+            // This message would not store; the next one may. Keep going.
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "cannot store a POP3 message");
+                give_up_later(db, &account.id, &entry.uidl).await;
+                failure = Some(e);
+            }
+            Err(e) => {
                 failure = Some(e);
                 break;
             }
@@ -720,6 +790,33 @@ mod tests {
         let mut stale = stale_ids(&listing(&[(1, "b")]), &seen(&["a", "b", "c"]));
         stale.sort();
         assert_eq!(stale, ["a", "c"]);
+    }
+
+    #[test]
+    fn a_message_that_keeps_failing_is_given_up_after_three_passes() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|conn| {
+            ensure_schema(conn)?;
+            conn.execute(
+                "INSERT INTO accounts (id, email, provider, imap_host, smtp_host, created_at)
+                 VALUES ('acc', 'me@example.com', 'pop3', 'pop.example.com', 'smtp.example.com', 0)",
+                [],
+            )?;
+            assert!(!note_failure(conn, "acc", "bad")?);
+            assert!(!note_failure(conn, "acc", "bad")?);
+            assert!(note_failure(conn, "acc", "bad")?);
+            let seen: i64 = conn.query_row(
+                "SELECT count(*) FROM pop3_seen WHERE uidl = 'bad'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(seen, 1);
+            let pending: i64 =
+                conn.query_row("SELECT count(*) FROM pop3_failed", [], |r| r.get(0))?;
+            assert_eq!(pending, 0);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

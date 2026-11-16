@@ -110,6 +110,7 @@
   "contacts.err_group_name": "请输入群组名称。",
   "contacts.err_group_exists": "已有同名的群组。",
   "contacts.err_import_empty": "这个文件里没有找到联系人。",
+  "contacts.err_import_too_large": "这个文件太大，不像是通讯录。",
   "nav.collapse": "折叠侧边栏",
   "nav.expand": "展开侧边栏",
   "list.unread_other": "{n} 封未读",

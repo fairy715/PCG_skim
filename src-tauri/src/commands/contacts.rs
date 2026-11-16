@@ -8,6 +8,9 @@ use crate::state::AppState;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
+/// Largest file accepted for a contacts import.
+const MAX_IMPORT_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Suggestions shown under a recipient field.
 const MAX_SUGGESTIONS: usize = 8;
 
@@ -144,18 +147,33 @@ pub async fn import_contacts(
     let path = picked
         .into_path()
         .map_err(|e| SkimError::other("io", e.to_string()))?;
+    // An address book of tens of thousands of people is a few megabytes; a
+    // file far beyond that is not one, and would only tie the app up.
+    if tokio::fs::metadata(&path).await?.len() > MAX_IMPORT_BYTES {
+        return Err(SkimError::other(
+            "contacts_too_large",
+            "this file is too large to be an address book",
+        ));
+    }
     let bytes = tokio::fs::read(&path).await?;
 
+    // A file that is not Unicode says nothing about its encoding; the UI
+    // language is the best hint for which Windows wrote it.
+    let locale = state
+        .db
+        .call(|conn| queries::get_setting(conn, "locale"))
+        .await?
+        .unwrap_or_default();
+    // Parsed off the database thread: sync and the op queue keep going.
+    let (entries, skipped) = tokio::task::spawn_blocking(move || {
+        let text = contacts::decode_file(&bytes, contacts::legacy_encoding(&locale));
+        contacts::parse_file(&text)
+    })
+    .await
+    .map_err(|e| SkimError::other("internal", e.to_string()))?;
     let report = state
         .db
-        .call(move |conn| {
-            // A file that is not Unicode says nothing about its encoding; the
-            // UI language is the best hint for which Windows wrote it.
-            let locale = queries::get_setting(conn, "locale")?.unwrap_or_default();
-            let text = contacts::decode_file(&bytes, contacts::legacy_encoding(&locale));
-            let (entries, skipped) = contacts::parse_file(&text);
-            contacts::import(conn, &entries, skipped)
-        })
+        .call(move |conn| contacts::import(conn, &entries, skipped))
         .await?;
     if report.added + report.updated + report.skipped == 0 {
         return Err(SkimError::other(

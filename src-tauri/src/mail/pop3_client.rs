@@ -12,7 +12,7 @@
 
 use crate::error::{Result, SkimError};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -26,6 +26,16 @@ const LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_STATUS_LINE: usize = 4096;
 /// Refuse to buffer a single message beyond this; nothing sane is larger.
 const MAX_MESSAGE_BYTES: usize = 150 * 1024 * 1024;
+/// The maildrop listing: about 400,000 entries at RFC 1939's longest ids.
+const MAX_LISTING_BYTES: usize = 32 * 1024 * 1024;
+/// The capability list.
+const MAX_CAPA_BYTES: usize = 64 * 1024;
+/// A whole download, however steadily the server trickles it: the per-line
+/// leash alone would let a server keep one RETR going indefinitely, and the
+/// account's outgoing mail waits behind the pass.
+const RETR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// A whole listing or capability response.
+const LISTING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -69,15 +79,23 @@ impl<S: Stream> Pop3<S> {
         self.io.into_inner()
     }
 
-    /// Read one CRLF-terminated line, without its line ending.
-    async fn read_line(&mut self, leash: std::time::Duration) -> Result<Vec<u8>> {
+    /// Read one CRLF-terminated line of at most `max` bytes, without its line
+    /// ending. The cap applies while reading: a server that never sends a line
+    /// break must not be able to fill memory before the length is checked.
+    async fn read_line(&mut self, leash: std::time::Duration, max: usize) -> Result<Vec<u8>> {
         let mut line = Vec::new();
-        let n = tokio::time::timeout(leash, self.io.read_until(b'\n', &mut line))
+        // Room for the CRLF on top of `max`, plus one byte to notice overflow.
+        let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(3);
+        let mut capped = (&mut self.io).take(limit);
+        let n = tokio::time::timeout(leash, capped.read_until(b'\n', &mut line))
             .await
             .map_err(|_| network("the POP3 server stopped responding"))?
             .map_err(|e| network(format!("POP3 connection failed: {e}")))?;
         if n == 0 {
             return Err(network("the POP3 server closed the connection"));
+        }
+        if !line.ends_with(b"\n") && line.len() as u64 >= limit {
+            return Err(proto("the server sent an oversized line"));
         }
         if line.ends_with(b"\n") {
             line.pop();
@@ -90,7 +108,7 @@ impl<S: Stream> Pop3<S> {
 
     /// Read a status line and return the text after `+OK`; `-ERR` is an error.
     async fn read_status(&mut self) -> Result<String> {
-        let line = self.read_line(COMMAND_TIMEOUT).await?;
+        let line = self.read_line(COMMAND_TIMEOUT, MAX_STATUS_LINE).await?;
         if line.len() > MAX_STATUS_LINE {
             return Err(proto("the server sent an oversized status line"));
         }
@@ -122,26 +140,38 @@ impl<S: Stream> Pop3<S> {
         self.read_status().await
     }
 
-    /// Read a multi-line response body up to the lone `.` terminator, undoing
-    /// dot-stuffing. Lines are rejoined with CRLF, as they were on the wire.
-    async fn read_multiline(&mut self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        loop {
-            let line = self.read_line(LINE_TIMEOUT).await?;
-            if line == b"." {
-                return Ok(out);
+    /// Read a multi-line response body of at most `max` bytes up to the lone
+    /// `.` terminator, undoing dot-stuffing. Lines are rejoined with CRLF, as
+    /// they were on the wire. The whole read must finish within `deadline`.
+    async fn read_multiline(
+        &mut self,
+        max: usize,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        let read = async {
+            let mut out = Vec::new();
+            loop {
+                // One more byte than the room left, for a dot-stuffed line.
+                let room = max.saturating_sub(out.len()).saturating_add(1);
+                let line = self.read_line(LINE_TIMEOUT, room).await?;
+                if line == b"." {
+                    return Ok(out);
+                }
+                let data = if line.starts_with(b".") {
+                    &line[1..]
+                } else {
+                    &line[..]
+                };
+                if out.len() + data.len() + 2 > max {
+                    return Err(proto("message is too large to download"));
+                }
+                out.extend_from_slice(data);
+                out.extend_from_slice(b"\r\n");
             }
-            let data = if line.starts_with(b".") {
-                &line[1..]
-            } else {
-                &line[..]
-            };
-            if out.len() + data.len() + 2 > MAX_MESSAGE_BYTES {
-                return Err(proto("message is too large to download"));
-            }
-            out.extend_from_slice(data);
-            out.extend_from_slice(b"\r\n");
-        }
+        };
+        tokio::time::timeout(deadline, read)
+            .await
+            .map_err(|_| network("the POP3 server is sending too slowly"))?
     }
 
     pub async fn read_greeting(&mut self) -> Result<()> {
@@ -157,7 +187,9 @@ impl<S: Stream> Pop3<S> {
             Err(e) if e.code() == "pop3" => return Ok(Vec::new()),
             Err(e) => return Err(e),
         }
-        let body = self.read_multiline().await?;
+        let body = self
+            .read_multiline(MAX_CAPA_BYTES, LISTING_DEADLINE)
+            .await?;
         Ok(String::from_utf8_lossy(&body)
             .lines()
             .filter_map(|l| l.split_whitespace().next())
@@ -197,14 +229,16 @@ impl<S: Stream> Pop3<S> {
             ),
             _ => e,
         })?;
-        let body = self.read_multiline().await?;
+        let body = self
+            .read_multiline(MAX_LISTING_BYTES, LISTING_DEADLINE)
+            .await?;
         Ok(parse_uidl(&body))
     }
 
     /// Download one message in full.
     pub async fn retr(&mut self, number: u32) -> Result<Vec<u8>> {
         self.command(&format!("RETR {number}")).await?;
-        self.read_multiline().await
+        self.read_multiline(MAX_MESSAGE_BYTES, RETR_DEADLINE).await
     }
 
     /// End the session. Skim never issues DELE, so QUIT removes nothing.
@@ -431,6 +465,69 @@ mod tests {
         pop.read_greeting().await.unwrap();
         let e = pop.login("me\r\nDELE 1", "x").await.unwrap_err();
         assert_eq!(e.code(), "auth");
+    }
+
+    #[tokio::test]
+    async fn an_endless_line_is_refused_without_reading_it_all() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            // A "greeting" that never ends: refused once it passes the cap,
+            // not after the server stops sending.
+            let chunk = vec![b'A'; 16 * 1024];
+            while server.write_all(&chunk).await.is_ok() {}
+        });
+        let mut pop = Pop3::new(client);
+        let err = pop.read_greeting().await.unwrap_err();
+        assert_eq!(err.code(), "pop3");
+    }
+
+    #[tokio::test]
+    async fn a_body_line_is_capped_by_the_room_left() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            server.write_all(b"short\r\n").await.unwrap();
+            server.write_all(&[b'B'; 100]).await.unwrap();
+            server.write_all(b"\r\n.\r\n").await.unwrap();
+        });
+        let mut pop = Pop3::new(client);
+        let err = pop
+            .read_multiline(64, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "pop3");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fits_its_cap_is_read() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server.write_all(b"..dot\r\nend\r\n.\r\n").await.unwrap();
+        });
+        let mut pop = Pop3::new(client);
+        let body = pop
+            .read_multiline(12, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(body, b".dot\r\nend\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_trickling_server_runs_into_the_deadline() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            loop {
+                if server.write_all(b"x\r\n").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        let mut pop = Pop3::new(client);
+        let err = pop
+            .read_multiline(MAX_MESSAGE_BYTES, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "network");
     }
 
     #[test]

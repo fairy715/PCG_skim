@@ -270,54 +270,89 @@ fn is_mail_item(class: &str) -> bool {
         || c == "ipm"
 }
 
+/// Most folders a file may have. Real mailboxes hold hundreds; a file that
+/// lists more is broken or built to make the walk run away.
+const MAX_FOLDERS: usize = 20_000;
+
 /// Walk the mailbox tree, collecting mail folders in display order and the
-/// contacts folders.
-fn collect_folders(source: &Source) -> Result<Folders> {
+/// contacts folders. `None` when `cancel` was raised during the walk.
+fn collect_folders(source: &Source, cancel: &AtomicBool) -> Result<Option<Folders>> {
     let root_id = source
         .store()
         .properties()
         .ipm_sub_tree_entry_id()
         .map_err(pst_err)?;
     let root = source.store().open_folder(&root_id).map_err(pst_err)?;
-    let mut out = Folders::default();
-    walk(source, &root, &[], &mut out, 0);
-    Ok(out)
+    let mut walk = Walk {
+        source,
+        cancel,
+        seen: HashSet::from([u32::from(root.properties().node_id())]),
+        out: Folders::default(),
+    };
+    if !walk.descend(&root, &[], 0) {
+        return Ok(None);
+    }
+    Ok(Some(walk.out))
 }
 
-fn walk(source: &Source, parent: &Rc<dyn Folder>, path: &[String], out: &mut Folders, depth: u8) {
-    // A folder tree this deep is a corrupt file looping on itself.
-    if depth > 32 {
-        return;
-    }
-    let Some(table) = parent.hierarchy_table() else {
-        return;
-    };
-    let mut children: Vec<(String, Rc<dyn Folder>)> = table
-        .rows_matrix()
-        .filter_map(|row| source.folder(NodeId::from(u32::from(row.id()))).ok())
-        .map(|f| {
-            let name = f.properties().display_name().unwrap_or_default();
+struct Walk<'a> {
+    source: &'a Source,
+    cancel: &'a AtomicBool,
+    /// Every folder taken so far. A hierarchy table may name a folder that is
+    /// already in the tree — its own parent, or itself — and each folder is
+    /// visited once, so such a file cannot make the walk repeat or loop.
+    seen: HashSet<u32>,
+    out: Folders,
+}
+
+impl Walk<'_> {
+    /// Collect the folders under `parent`. False when cancelled.
+    fn descend(&mut self, parent: &Rc<dyn Folder>, path: &[String], depth: u8) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Deeper than any real mailbox; also keeps the recursion shallow.
+        if depth > 32 {
+            return true;
+        }
+        let Some(table) = parent.hierarchy_table() else {
+            return true;
+        };
+        let mut children: Vec<(String, Rc<dyn Folder>)> = Vec::new();
+        for row in table.rows_matrix() {
+            let id = u32::from(row.id());
+            if self.seen.len() >= MAX_FOLDERS || !self.seen.insert(id) {
+                continue;
+            }
+            let Ok(folder) = self.source.folder(NodeId::from(id)) else {
+                continue;
+            };
+            let name = folder.properties().display_name().unwrap_or_default();
             // "/" is the path separator in the sidebar.
             let name = name.trim().replace('/', "-");
-            (name, f)
-        })
-        .filter(|(name, _)| !name.is_empty())
-        .collect();
-    children.sort_by_key(|(name, _)| name.to_lowercase());
-    for (name, folder) in children {
-        let class = text_of(folder.properties().get(PR_CONTAINER_CLASS), 1252);
-        let mut child_path = path.to_vec();
-        child_path.push(name);
-        if is_mail_folder(class.as_deref()) {
-            out.mail.push(PstFolder {
-                path: child_path.clone(),
-                folder: folder.clone(),
-            });
-        } else if pst_contacts::is_contacts_folder(class.as_deref()) {
-            out.contacts.push(folder.clone());
+            if !name.is_empty() {
+                children.push((name, folder));
+            }
         }
-        // Mail folders can sit under a non-mail parent, so always descend.
-        walk(source, &folder, &child_path, out, depth + 1);
+        children.sort_by_key(|(name, _)| name.to_lowercase());
+        for (name, folder) in children {
+            let class = text_of(folder.properties().get(PR_CONTAINER_CLASS), 1252);
+            let mut child_path = path.to_vec();
+            child_path.push(name);
+            if is_mail_folder(class.as_deref()) {
+                self.out.mail.push(PstFolder {
+                    path: child_path.clone(),
+                    folder: folder.clone(),
+                });
+            } else if pst_contacts::is_contacts_folder(class.as_deref()) {
+                self.out.contacts.push(folder.clone());
+            }
+            // Mail folders can sit under a non-mail parent, so always descend.
+            if !self.descend(&folder, &child_path, depth + 1) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -613,11 +648,6 @@ fn run_with(
     mut report: impl FnMut(&Progress),
 ) -> Result<Progress> {
     let source = Source::open(path)?;
-    let Folders {
-        mail: folders,
-        contacts: contact_folders,
-    } = collect_folders(&source)?;
-
     let mut progress = Progress {
         account_id: account_id.to_string(),
         phase: Phase::Running,
@@ -627,6 +657,15 @@ fn run_with(
         failed: 0,
         contacts: 0,
         message: None,
+    };
+    let Some(Folders {
+        mail: folders,
+        contacts: contact_folders,
+    }) = collect_folders(&source, cancel)?
+    else {
+        progress.phase = Phase::Cancelled;
+        report(&progress);
+        return Ok(progress);
     };
     progress.total = folders
         .iter()
@@ -783,6 +822,17 @@ fn setting_key(account_id: &str) -> String {
     format!("pst_import:{account_id}")
 }
 
+/// Starts since the import last got anywhere, counted by [`resume`].
+fn tries_key(account_id: &str) -> String {
+    format!("pst_import_tries:{account_id}")
+}
+
+/// Automatic restarts allowed without progress. The release build aborts on
+/// a panic, and a malformed file can make the PST library panic (or run out
+/// of memory): without a limit, such a file would take the app down a few
+/// seconds after every start, for good.
+const MAX_RESUMES_WITHOUT_PROGRESS: u32 = 2;
+
 /// Latest progress of every import that is running.
 pub fn status() -> Vec<Progress> {
     registry()
@@ -833,7 +883,14 @@ pub fn launch(app: &AppHandle, db: &Db, data_dir: &Path, account_id: &str, path:
         let _ = db.with(|conn| crate::db::queries::set_setting(conn, &key, &source));
 
         let mut folders_seen = 0u64;
+        let tries = tries_key(&account_id);
+        let mut tries_cleared = false;
         let outcome = run(&db, &data_dir, &account_id, &path, &cancel, |progress| {
+            // The file reads: count the next start as a fresh one.
+            if !tries_cleared && progress.imported > 0 {
+                tries_cleared = true;
+                let _ = db.with(|conn| delete_setting(conn, &tries));
+            }
             if let Ok(mut registry) = registry().lock() {
                 if let Some(run) = registry.get_mut(&progress.account_id) {
                     run.last = Some(progress.clone());
@@ -866,13 +923,10 @@ pub fn launch(app: &AppHandle, db: &Db, data_dir: &Path, account_id: &str, path:
         // Finished or deliberately stopped: nothing to resume. After an error
         // (the file was on a drive that went away) the next start tries again.
         if last.phase != Phase::Error {
-            let _ = db.with(|conn| {
-                conn.execute(
-                    "DELETE FROM settings WHERE key = ?1",
-                    rusqlite::params![key],
-                )
-            });
+            let _ = db.with(|conn| delete_setting(conn, &key));
         }
+        // It ended without bringing the app down.
+        let _ = db.with(|conn| delete_setting(conn, &tries));
         if let Ok(mut registry) = registry().lock() {
             registry.remove(&account_id);
         }
@@ -883,16 +937,49 @@ pub fn launch(app: &AppHandle, db: &Db, data_dir: &Path, account_id: &str, path:
     });
 }
 
-/// Continue an import that did not finish, if this account has one.
+fn delete_setting(conn: &rusqlite::Connection, key: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        rusqlite::params![key],
+    )
+}
+
+/// Continue an import that did not finish, if this account has one — unless
+/// the last starts all ended with the app going down before any progress.
+/// Importing the file again by hand still works, and resets the count.
 pub fn resume(app: &AppHandle, db: &Db, data_dir: &Path, account_id: &str) {
     let key = setting_key(account_id);
     let path = db
         .with(|conn| crate::db::queries::get_setting(conn, &key))
         .ok()
         .flatten();
-    if let Some(path) = path.filter(|p| Path::new(p).is_file()) {
-        launch(app, db, data_dir, account_id, PathBuf::from(path));
+    let Some(path) = path.filter(|p| Path::new(p).is_file()) else {
+        return;
+    };
+    if !may_resume(db, account_id) {
+        tracing::warn!(
+            account_id,
+            "PST import keeps stopping the app; not resuming it automatically"
+        );
+        return;
     }
+    launch(app, db, data_dir, account_id, PathBuf::from(path));
+}
+
+/// Count this automatic start, and say whether it may go ahead.
+fn may_resume(db: &Db, account_id: &str) -> bool {
+    let key = tries_key(account_id);
+    db.with(|conn| {
+        let tries: u32 = crate::db::queries::get_setting(conn, &key)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if tries >= MAX_RESUMES_WITHOUT_PROGRESS {
+            return Ok(false);
+        }
+        crate::db::queries::set_setting(conn, &key, &(tries + 1).to_string())?;
+        Ok(true)
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -979,6 +1066,30 @@ mod tests {
     /// two in Projects (plain text; HTML with an inline image).
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pst")
+    }
+
+    #[test]
+    fn a_cancel_during_the_folder_walk_stops_before_anything_is_stored() {
+        let db = archive_db();
+        let dir = temp_dir("cancel-walk");
+        let cancel = AtomicBool::new(true);
+        let p = run(&db, &dir, "arc", &fixture(), &cancel, |_| {}).unwrap();
+        assert_eq!(p.phase, Phase::Cancelled);
+        assert_eq!(p.imported, 0);
+    }
+
+    #[test]
+    fn automatic_restarts_stop_when_they_get_nowhere() {
+        let db = archive_db();
+        for _ in 0..MAX_RESUMES_WITHOUT_PROGRESS {
+            assert!(may_resume(&db, "arc"));
+        }
+        // Every one of those starts took the app down before any progress.
+        assert!(!may_resume(&db, "arc"));
+        // Progress (or a clean end) clears the count.
+        db.with(|conn| delete_setting(conn, &tries_key("arc")))
+            .unwrap();
+        assert!(may_resume(&db, "arc"));
     }
 
     fn archive_db() -> Db {
